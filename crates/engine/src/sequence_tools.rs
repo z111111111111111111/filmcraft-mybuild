@@ -748,7 +748,7 @@ fn named_track_index(name: &str) -> Option<(bool, usize)> {
 /// Sequences still start at three video and three audio tracks; only an explicit higher name
 /// grows them (up to `MAX_TRACKS` of a kind). Anything else still errors in `track_p`.
 pub(crate) fn ensure_named_tracks(s: &mut Session, p: &Value, cmd: &'static str) -> Result<()> {
-    let mut (want_v, want_a) = (0usize, 0usize);
+    let (mut want_v, mut want_a) = (0usize, 0usize);
     let mut scan = |v: &Value| {
         if let Some(name) = v.as_str()
             && let Some((video, n)) = named_track_index(name)

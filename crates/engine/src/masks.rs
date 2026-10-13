@@ -11,7 +11,7 @@
 //! key folds a continuous drag into one step).
 
 use filmcraft_geom::{Affine, Vec2};
-use filmcraft_project::{ClipId, EffectInstance, Mask, MaskMode, MaskPath, MaskVertex, Param, ParamValue, TrackKind, TrackMethod};
+use filmcraft_project::{ClipId, EffectInstance, Mask, MaskMode, MaskPath, MaskVertex, ParamValue, TrackKind, TrackMethod};
 use filmcraft_time::Tick;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
