@@ -174,8 +174,10 @@ fn simplify(pts: &[(f64, f64)], eps: f64) -> Vec<(f64, f64)> {
         return pts.to_vec();
     }
     let mut keep = vec![false; pts.len()];
-    if let (Some(first), Some(last)) = (keep.first_mut(), keep.last_mut()) {
+    if let Some(first) = keep.first_mut() {
         *first = true;
+    }
+    if let Some(last) = keep.last_mut() {
         *last = true;
     }
     let mut stack = vec![(0usize, pts.len().saturating_sub(1))];
@@ -183,11 +185,11 @@ fn simplify(pts: &[(f64, f64)], eps: f64) -> Vec<(f64, f64)> {
         if b <= a.saturating_add(1) {
             continue;
         }
-        let (ax, ay) = pts.get(a).copied().unwrap_or((0.0, 0.0));
-        let (bx, by) = pts.get(b).copied().unwrap_or((0.0, 0.0));
+        let (ax, ay) = pts.get(a).copied().unwrap_or((0.0f64, 0.0f64));
+        let (bx, by) = pts.get(b).copied().unwrap_or((0.0f64, 0.0f64));
         let (dx, dy) = (bx - ax, by - ay);
-        let len = dx.hypot(dy).max(1e-9);
-        let mut far = 0.0;
+        let len = dx.hypot(dy).max(1e-9f64);
+        let mut far = 0.0f64;
         let mut idx = a;
         for i in a.saturating_add(1)..b {
             let Some((px, py)) = pts.get(i).copied() else { continue };
@@ -210,7 +212,7 @@ fn simplify(pts: &[(f64, f64)], eps: f64) -> Vec<(f64, f64)> {
 
 /// Bounding box of the selected pixels (fallback when the traced boundary degenerates).
 fn bbox(mask: &[u8], w: usize, h: usize) -> Option<(f64, f64, f64, f64)> {
-    let (mut x0, mut y0, mut x1, mut y1) = (w as f64, h as f64, -1.0, -1.0);
+    let (mut x0, mut y0, mut x1, mut y1): (f64, f64, f64, f64) = (w as f64, h as f64, -1.0, -1.0);
     for y in 0..h {
         for x in 0..w {
             if mask.get(y.saturating_mul(w).saturating_add(x)).is_some_and(|m| *m != 0) {
