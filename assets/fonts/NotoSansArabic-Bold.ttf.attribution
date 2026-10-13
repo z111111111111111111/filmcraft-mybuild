@@ -1,0 +1,8 @@
+asset:        NotoSansArabic-Bold.ttf
+title:        Noto Sans Arabic Bold (Arabic UI/text typeface)
+author:       The Noto Project Authors (Google Fonts, notofonts/arabic)
+source:       https://github.com/notofonts/arabic/releases/tag/NotoSansArabic-v2.013
+license:      OFL-1.1
+license-file: assets/fonts/OFL-NotoSansArabic.txt
+added:        2026-10-13 by Muse Spark (agent)
+notes:        Unmodified unhinted TTF from the upstream release zip (NotoSansArabic/unhinted/ttf/NotoSansArabic-Bold.ttf, v2.013), embedded via include_bytes! in the text engine (crates/text/src/fonts.rs). Bold companion to NotoSansArabic-Regular; used for bold Arabic titles and UI fallback.

@@ -1,0 +1,29 @@
+# Build a Windows .exe in the cloud (GitHub Actions) so no Rust is needed
+# on your own PC. Run it manually from the Actions tab, then download the
+# `filmcraft-windows-x64` artifact and launch filmcraft.exe (optionally with
+# WGPU_BACKEND=dx12, see run-dx12.bat).
+name: Build Windows EXE
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Check out the project
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build FilmCraft (release)
+        run: cargo build --release -p filmcraft -p filmcraft-cli
+
+      - name: Upload the executables
+        uses: actions/upload-artifact@v4
+        with:
+          name: filmcraft-windows-x64
+          path: |
+            target/release/filmcraft.exe
+            target/release/filmcraft-cli.exe
