@@ -674,6 +674,8 @@ fn select_at(app: &mut FilmcraftApp, clip: ClipId, human: bool, mut params: Valu
         Err(e) => app.ui.status = e.to_string(),
     }
 }
+
+fn pen_overlay(app: &mut FilmcraftApp, ui: &mut egui::Ui, pic: Rect, frame: (u32, u32)) {
     let Some(draft) = app.ui.mask_pen.clone() else { return };
     let ph = app.session.playhead();
     let clip = ClipId(draft.clip);
