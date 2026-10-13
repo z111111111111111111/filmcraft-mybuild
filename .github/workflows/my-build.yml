@@ -17,6 +17,11 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Cache cargo builds
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: filmcraft-windows-exe
+
       - name: Build FilmCraft (release)
         run: cargo build --release -p filmcraft -p filmcraft-cli
 
