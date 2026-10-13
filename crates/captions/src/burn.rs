@@ -134,7 +134,7 @@ pub fn render_caption(c: &Caption, style: &CaptionStyle, w: usize, h: usize) -> 
     if c.settings.contains("align:start") || c.settings.contains("align:end") {
         let rtl = match style.dir.as_rtl() {
             Some(b) => b,
-            None => lines.iter().any(has_rtl),
+            None => lines.iter().any(|l| has_rtl(l)),
         };
         if rtl {
             align = match align {
