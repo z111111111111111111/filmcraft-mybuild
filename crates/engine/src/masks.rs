@@ -1023,24 +1023,12 @@ fn download_package_seg(dir: &std::path::Path, m: &'static seg::catalogue::Model
 }
 
 #[cfg(feature = "segment-download")]
-fn download_model_inner(cmd: &str, dir: &std::path::Path, m: &'static seg::catalogue::ModelInfo) -> Result<Value> {
-    if seg::catalogue::installed(dir, m) {
-        return Ok(json!({"model": m.id, "installed": true}));
-    }
-    seg::catalogue::download(dir, m, &mut |_, _, _| true).map_err(|e| bad(cmd, e.to_string()))?;
-    Ok(json!({"model": m.id, "installed": true, "dir": seg::catalogue::model_dir(dir, m).to_string_lossy()}))
-}
-
-#[cfg(not(feature = "segment-download"))]
-fn download_model_inner(cmd: &str, _dir: &std::path::Path, _m: &'static seg::catalogue::ModelInfo) -> Result<Value> {
-    Err(bad(cmd, "model downloads are not available in this build (built without the `segment-download` feature)"))
-}
-
 fn new_job(s: &mut Session, label: String) -> crate::Job {
     let id = s.jobs.iter().map(|j| j.id).max().unwrap_or(0) + 1;
     crate::Job { id, label, progress: Default::default(), result: Default::default() }
 }
 
+#[cfg(feature = "segment-download")]
 fn spawn(s: &mut Session, job: crate::Job, wait: bool, name: &str, run: impl FnOnce() + Send + 'static) -> Result<u64> {
     let id = job.id;
     let run = crate::export_tools::guard_job(job.progress.clone(), job.result.clone(), run);
@@ -1053,6 +1041,7 @@ fn spawn(s: &mut Session, job: crate::Job, wait: bool, name: &str, run: impl FnO
     Ok(id)
 }
 
+#[cfg(feature = "segment-download")]
 fn finish_job(prog: &filmcraft_export::Progress, res: &std::sync::Mutex<Option<std::result::Result<filmcraft_export::Report, String>>>, r: std::result::Result<String, String>, t0: web_time::Instant) {
     use std::sync::atomic::Ordering;
     use std::sync::PoisonError;

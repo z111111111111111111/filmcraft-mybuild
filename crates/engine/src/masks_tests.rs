@@ -1,6 +1,7 @@
 use serde_json::json;
 
 use crate::Session;
+use filmcraft_media::MediaSource;
 use filmcraft_project::ClipId;
 use filmcraft_time::Tick;
 
@@ -470,7 +471,7 @@ fn flat_session() -> (Session, ClipId) {
     (s, clip)
 }
 
-fn path_bbox(s: &Session) -> (f64, f64, f64, f64) {
+fn path_bbox(s: &mut Session) -> (f64, f64, f64, f64) {
     let l = s.execute("masks.list", json!({})).unwrap();
     let vs = l["masks"][0]["path"]["vertices"].as_array().unwrap();
     let mut b = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
@@ -491,13 +492,13 @@ fn select_object_masks_the_seeded_half() {
     let n = r["vertices"].as_u64().unwrap();
     assert!(n >= 3 && n <= 512, "{n}");
     assert!(s.state.selected_mask.is_some(), "the new mask is selected");
-    let b = path_bbox(&s);
+    let b = path_bbox(&mut s);
     assert!((b.0 - 0.0).abs() <= 3.0 && (b.1 - 0.0).abs() <= 3.0, "{b:?}");
     assert!((b.2 - 160.0).abs() <= 3.0 && (b.3 - 240.0).abs() <= 3.0, "{b:?}");
     // a box cuts the background from its border (with margin) and keeps the red strip
     let r = s.execute("masks.selectObject", json!({"clip": clip.0, "box": [150, 10, 180, 220], "feather": 1.5})).unwrap();
     assert_eq!(r["name"], "Object (2)");
-    let b = path_bbox(&s);
+    let b = path_bbox(&mut s);
     assert!((b.0 - 150.0).abs() <= 3.0 && (b.2 - 160.0).abs() <= 3.0, "{b:?}");
     // one undo step per selection
     s.execute("edit.undo", json!({})).unwrap();
@@ -512,7 +513,7 @@ fn select_human_is_the_person_preset_and_can_track() {
     let r = s.execute("masks.selectHuman", json!({"clip": clip.0, "box": [0, 0, 180, 240], "track": "none"})).unwrap();
     assert_eq!(r["name"], "Human (1)");
     assert!(r["track"].is_null());
-    let b = path_bbox(&s);
+    let b = path_bbox(&mut s);
     assert!((b.0 - 160.0).abs() <= 3.0 && (b.2 - 180.0).abs() <= 3.0, "{b:?}");
     // tracking starts as a background job from the same call
     let r = s.execute("masks.selectHuman", json!({"clip": clip.0, "point": [240, 120]})).unwrap();
