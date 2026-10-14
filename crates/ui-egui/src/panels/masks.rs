@@ -11,12 +11,13 @@
 
 use egui::{Align2, Color32, Pos2, Rect, Sense, Stroke, pos2, vec2};
 use filmcraft_geom::{Affine, Vec2};
-use filmcraft_project::{ClipId, EffectInstance, MaskMode, MaskPath, MaskVertex, TrackItem};
+use filmcraft_project::{ClipId, EffectInstance, MaskMode, MaskPath, MaskVertex, TrackItem, TrackKind};
 use filmcraft_time::Tick;
 use serde_json::{Value, json};
 
 use crate::FilmcraftApp;
 use crate::icons::{self, Icon};
+use crate::state::Tool;
 use crate::theme::Tokens;
 
 const ROW_H: f32 = 22.0;
@@ -227,6 +228,10 @@ fn inside(pts: &[Vec2], p: Vec2) -> bool {
 
 /// Mask editing on the Program monitor (selected mask) and the pen tool.
 pub fn monitor_overlay(app: &mut FilmcraftApp, ui: &mut egui::Ui, pic: Rect, frame: (u32, u32)) {
+    if matches!(app.ui.tool, Tool::ObjectSelect | Tool::HumanSelect) {
+        object_overlay(app, ui, pic, frame);
+        return;
+    }
     if app.ui.mask_pen.is_some() {
         pen_overlay(app, ui, pic, frame);
         return;
@@ -565,7 +570,110 @@ pub fn draft_path(points: &[[f64; 4]]) -> MaskPath {
     }
 }
 
-fn pen_overlay(app: &mut FilmcraftApp, ui: &mut egui::Ui, pic: Rect, frame: (u32, u32)) {
+/// Object / Human Select on the Program monitor: click seeds a point, dragging seeds a box.
+/// The seed grows into an editable vector mask on the targeted clip (the selected mask's clip,
+/// else the first selected video clip); Human Select tracks it forward, like isolating a
+/// subject over a background. After a selection the tool returns to Selection so the new
+/// outline is editable at once.
+fn object_overlay(app: &mut FilmcraftApp, ui: &mut egui::Ui, pic: Rect, frame: (u32, u32)) {
+    let human = app.ui.tool == Tool::HumanSelect;
+    let id = if human { "human-select" } else { "object-select" };
+    let clip = app.session.active_sequence().and_then(|q| {
+        app.session.state.selected_mask.map(|m| m.clip).or_else(|| {
+            app.session.state.selection.iter().copied().find(|c| {
+                q.find_item(*c).and_then(|(t, _)| q.track(t)).is_some_and(|t| t.kind == TrackKind::Video)
+            })
+        })
+    });
+    let Some(clip) = clip else {
+        app.ui.status = "Select a video clip first, then click an object to mask it".into();
+        return;
+    };
+    let Some(it) = app.session.active_sequence().and_then(|q| q.find_item(clip)).map(|(_, i)| i.clone()) else { return };
+    let ph = app.session.playhead();
+    if ph < it.start || ph >= it.end() {
+        app.ui.status = "Move the playhead over the clip, then click an object to mask it".into();
+        return;
+    }
+    let mt = it.source_time_at(ph);
+    let Some(to_clip) = clip_to_screen(app, &it, mt, pic, frame).and_then(|m| m.inverse()) else {
+        app.ui.status = "Select a video clip first, then click an object to mask it".into();
+        return;
+    };
+    let to_c = |p: Pos2| to_clip.apply(Vec2::new(p.x as f64, p.y as f64));
+    let resp = ui.interact(pic, egui::Id::new(id), Sense::click_and_drag());
+    app.auto.add(if human { "program.humanSelect" } else { "program.objectSelect" }, pic, if human { "Human Select" } else { "Object Select" });
+    if resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+    }
+    // press origin of a drag (a pure click never stores one); `placed` tells a release-click
+    // after a drag apart from a pure click, so exactly one of the two commits below runs
+    let start_id = egui::Id::new(id).with("start");
+    let placed_id = egui::Id::new(id).with("placed");
+    if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+        ui.data_mut(|m| {
+            m.remove::<Pos2>(start_id);
+            m.remove::<bool>(placed_id);
+        });
+        return;
+    }
+    if resp.drag_started_by(LEFT) {
+        if let Some(p) = resp.interact_pointer_pos() {
+            ui.data_mut(|m| {
+                m.insert_temp(start_id, p);
+                m.insert_temp(placed_id, true);
+            });
+        }
+    }
+    if resp.dragged_by(LEFT) {
+        if let (Some(a), Some(b)) = (ui.data(|m| m.get_temp::<Pos2>(start_id)), resp.interact_pointer_pos()) {
+            if (b - a).length() > 6.0 {
+                ui.painter().with_clip_rect(pic).rect_stroke(Rect::from_two_pos(a, b), 0.0, Stroke::new(1.5, Color32::WHITE), egui::StrokeKind::Inside);
+            }
+        }
+    }
+    // a pure click seeds a point (a drag stores a start first, so this never double-commits)
+    if resp.clicked_by(LEFT) && !ui.data(|m| m.get_temp::<bool>(placed_id)).unwrap_or(false) {
+        if let Some(p) = resp.interact_pointer_pos() {
+            let c = to_c(p);
+            select_at(app, clip, human, json!({"point": [c.x, c.y]}));
+        }
+    }
+    // release after a drag seeds a box, or a point when the pointer barely moved
+    if resp.drag_stopped_by(LEFT) {
+        let start = ui.data(|m| m.get_temp::<Pos2>(start_id));
+        ui.data_mut(|m| {
+            m.remove::<Pos2>(start_id);
+            m.remove::<bool>(placed_id);
+        });
+        if let (Some(a), Some(b)) = (start, resp.interact_pointer_pos()) {
+            let params = if (b - a).length() > 6.0 {
+                let r = Rect::from_two_pos(a, b);
+                let (p0, p1) = (to_c(r.min), to_c(r.max));
+                json!({"box": [p0.x, p0.y, p1.x - p0.x, p1.y - p0.y]})
+            } else {
+                let c = to_c(b);
+                json!({"point": [c.x, c.y]})
+            };
+            select_at(app, clip, human, params);
+        }
+    }
+}
+
+/// Run `masks.selectObject` / `masks.selectHuman` with `clip` filled in: report the new outline
+/// and return to the Selection tool so it is editable at once.
+fn select_at(app: &mut FilmcraftApp, clip: ClipId, human: bool, mut params: Value) {
+    params["clip"] = json!(clip.0);
+    let cmd = if human { "masks.selectHuman" } else { "masks.selectObject" };
+    match app.session.execute(cmd, params) {
+        Ok(r) => {
+            let n = r["vertices"].as_u64().unwrap_or(0);
+            app.ui.status = format!("{} mask with {n} points — drag its vertices to refine it", r["name"].as_str().unwrap_or("Object"));
+            app.ui.tool = Tool::Selection;
+        }
+        Err(e) => app.ui.status = e.to_string(),
+    }
+}
     let Some(draft) = app.ui.mask_pen.clone() else { return };
     let ph = app.session.playhead();
     let clip = ClipId(draft.clip);

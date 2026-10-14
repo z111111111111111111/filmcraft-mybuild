@@ -160,6 +160,17 @@ fn next_boundary(s: &str, i: usize) -> usize {
     s[i..].chars().next().map_or(i, |c| i + c.len_utf8())
 }
 
+/// Whether the caret at byte `i` sits in right-to-left text (Arabic/Hebrew letter on either
+/// side). Arrow keys move visually in the Program monitor's direct text editing: in RTL text
+/// Left means logically next and Right means logically previous.
+fn caret_is_rtl(s: &str, i: usize) -> bool {
+    use unicode_bidi::{BidiClass, bidi_class};
+    let i = i.min(s.len());
+    let rtl = |c: Option<char>| c.is_some_and(|c| matches!(bidi_class(c), BidiClass::R | BidiClass::AL | BidiClass::AN));
+    // the character being left (before the caret) decides, else the one being entered
+    rtl(s[..i].chars().next_back()).max(rtl(s[i..].chars().next()))
+}
+
 #[derive(Clone, Copy, Debug)]
 enum DragKind {
     Move,
@@ -1088,24 +1099,31 @@ fn text_edit(app: &mut FilmcraftApp, ui: &mut egui::Ui, v: &LayerView, mut ed: G
                     }
                     egui::Key::ArrowLeft => {
                         let (a, _) = sel(&ed);
+                        // visual movement: in RTL text Left steps logically forward
+                        let rtl = caret_is_rtl(&text, ed.caret);
                         moved = Some(if !shift && ed.caret != ed.anchor {
                             a
                         } else if modifiers.command {
                             l.lines[l.caret(ed.caret).2].range.start
                         } else if modifiers.alt {
                             word_left(&text, ed.caret)
+                        } else if rtl {
+                            next_boundary(&text, ed.caret)
                         } else {
                             prev_boundary(&text, ed.caret)
                         });
                     }
                     egui::Key::ArrowRight => {
                         let (_, b) = sel(&ed);
+                        let rtl = caret_is_rtl(&text, ed.caret);
                         moved = Some(if !shift && ed.caret != ed.anchor {
                             b
                         } else if modifiers.command {
                             l.lines[l.caret(ed.caret).2].range.end
                         } else if modifiers.alt {
                             word_right(&text, ed.caret)
+                        } else if rtl {
+                            prev_boundary(&text, ed.caret)
                         } else {
                             next_boundary(&text, ed.caret)
                         });
@@ -1683,6 +1701,22 @@ pub fn properties(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
                 cx.auto(&format!("align.{i}"), r.rect, tip);
                 if r.clicked() {
                     cx.set("align", json!(i));
+                }
+            }
+            let dir = match pv(e, "dir", mt) {
+                ParamValue::Choice(c) => c.min(2),
+                _ => 0,
+            };
+            let (_, mut vui) = cx.row(ui, tl!("Direction"));
+            for (i, (label, tip)) in
+                [("A", tl!("Auto (follows the first strong character)")), ("L", tl!("Left to Right")), ("R", tl!("Right to left"))]
+                    .iter()
+                    .enumerate()
+            {
+                let r = letter_button(&mut vui, label, tip, dir == i as u32, &t, Tokens::ui(12.0));
+                cx.auto(&format!("dir.{i}"), r.rect, tip);
+                if r.clicked() {
+                    cx.set("dir", json!(i));
                 }
             }
             cx.number(ui, tl!("Tracking"), "tracking", 1.0, (-1000.0, 10_000.0), 0, "");

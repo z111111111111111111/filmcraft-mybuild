@@ -304,7 +304,9 @@ pub(crate) fn clips_p(s: &Session, p: &Value) -> Vec<ClipId> {
 /// The track parameter `k` names: a track id, or "V1" / "A2" (kind and 1-based number).
 /// `Ok(None)` when the parameter is absent. Naming a track the active sequence does not have is
 /// an error (bad parameters of `cmd`): callers fall back to a default track only when no track
-/// was asked for.
+/// was asked for. (`timeline.place` and `timeline.move` grow the sequence first through
+/// `sequence_tools::ensure_named_tracks`, so a higher `Vn` / `An` works there; every other
+/// caller still errors here.)
 pub(crate) fn track_p(s: &Session, p: &Value, k: &str, cmd: &str) -> Result<Option<TrackId>> {
     let v = match p.get(k) {
         None | Some(Value::Null) => return Ok(None),
@@ -2480,11 +2482,11 @@ fn build() -> Vec<CommandSpec> {
             "Place Clip",
             [],
             None,
-            r#"{"item":id|"items":[id] (back to back, one undo step),"track":"V1"|id|"A1" (sound only)|"new" (a video track after the last)?,"audioTrack":"A1"|id|"new"?,"time":ticks|"frame":i64|"seconds":f64,"insert":bool,"sourceIn":ticks?,"duration":ticks?,"video":bool=true,"audio":bool=true}"#,
+            r#"{"item":id|"items":[id] (back to back, one undo step),"track":"V1"|id|"A1" (sound only)|"new" (a video track after the last)|"V4" (past the last track: the missing tracks are added),"audioTrack":"A1"|id|"new"?,"time":ticks|"frame":i64|"seconds":f64,"insert":bool,"sourceIn":ticks?,"duration":ticks?,"video":bool=true,"audio":bool=true}"#,
             has_seq,
             |s, p| match p.get("items") {
-                Some(items) => place_items(s, p, items),
-                None => place_one(s, p),
+                Some(items) => crate::sequence_tools::with_ensured_tracks(s, p, "timeline.place", |s| place_items(s, p, items)),
+                None => crate::sequence_tools::with_ensured_tracks(s, p, "timeline.place", |s| place_one(s, p)),
             }
         ),
         cmd!("timeline.select", "Select Clips", [], None, r#"{"clips":[id],"transitions":[id]?,"add":bool,"toggle":bool}"#, has_seq, |s, p| {
@@ -2526,13 +2528,13 @@ fn build() -> Vec<CommandSpec> {
             "Move Clips",
             [],
             None,
-            r#"{"moves":[{"clip":id,"track":id|"V2"|"new" (after the last of its kind),"time":ticks}],"insert":bool,"linked":bool?,"copy":bool?}"#,
+            r#"{"moves":[{"clip":id,"track":id|"V2"|"new" (after the last of its kind)|"V4" (past the last track: the missing tracks are added),"time":ticks}],"insert":bool,"linked":bool?,"copy":bool?}"#,
             has_seq,
             |s, p| {
                 if crate::sequence_tools::move_wants_new_track(p) {
                     return crate::sequence_tools::move_to_new_tracks(s, p);
                 }
-                move_clips(s, p)
+                crate::sequence_tools::with_ensured_tracks(s, p, "timeline.move", |s| move_clips(s, p))
             }
         ),
         cmd!(
@@ -2897,6 +2899,77 @@ fn build() -> Vec<CommandSpec> {
             }
             Ok(Value::Null)
         }),
+        cmd!("effects.reorder", "Reorder Effects", [], None, r#"{"clip":id,"from":n,"to":n (final position among the clip's effects)}"#, has_seq, |s, p| {
+            let c = clip_p(p, "clip").ok_or_else(|| bad("effects.reorder", "need `clip`"))?;
+            let from = u64_p(p, "from").ok_or_else(|| bad("effects.reorder", "need `from`"))? as usize;
+            let to = u64_p(p, "to").ok_or_else(|| bad("effects.reorder", "need `to`"))? as usize;
+            s.edit_sequence("Reorder Effects", |q, _, _| {
+                let (_, it) = q.find_item_mut(c).ok_or(filmcraft_edit::EditError::NoItem(c))?;
+                let len = it.effects.len();
+                if from >= len || to >= len {
+                    return Err(bad("effects.reorder", "no such effect").into());
+                }
+                // Motion, Opacity and the other fixed effects stay where they are: only
+                // standard effects reorder, like layers.
+                for i in [from, to] {
+                    if it.effects[i].def().is_some_and(|d| d.intrinsic) {
+                        return Err(bad("effects.reorder", "fixed effects (Motion, Opacity, …) stay where they are").into());
+                    }
+                }
+                if from != to {
+                    let e = it.effects.remove(from);
+                    it.effects.insert(to.min(it.effects.len()), e);
+                }
+                Ok(())
+            })?;
+            Ok(Value::Null)
+        }),
+        cmd!("effects.deleteKeyframes", "Delete Keyframes", [], None, r#"{"keyframes":[{"clip":id,"effect":index|id,"param":str,"mask":n?,"time":mediaTicks}]}"#, has_seq, |s, p| {
+            let keys = p.get("keyframes").and_then(Value::as_array).ok_or_else(|| bad("effects.deleteKeyframes", "need `keyframes`"))?;
+            if keys.is_empty() {
+                return Err(bad("effects.deleteKeyframes", "need at least one keyframe"));
+            }
+            // validate everything before changing anything: one undo step or none
+            let targets = keys
+                .iter()
+                .map(|k| {
+                    let clip = k.get("clip").and_then(Value::as_u64).map(ClipId).ok_or_else(|| bad("effects.deleteKeyframes", "each keyframe needs `clip`"))?;
+                    let param = k.get("param").and_then(Value::as_str).ok_or_else(|| bad("effects.deleteKeyframes", "each keyframe needs `param`"))?.to_string();
+                    let time = k.get("time").and_then(Value::as_i64).map(Tick).ok_or_else(|| bad("effects.deleteKeyframes", "each keyframe needs `time`"))?;
+                    Ok((clip, k.get("effect").cloned().unwrap_or(json!("motion")), k.get("mask").cloned().unwrap_or(Value::Null), param, time))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            s.edit_sequence("Delete Keyframes", |q, _, _| {
+                for (clip, eff, mask, param, time) in &targets {
+                    let (_, it) = q.find_item_mut(*clip).ok_or(filmcraft_edit::EditError::NoItem(*clip))?;
+                    let e = match eff {
+                        Value::Number(n) => it.effects.get_mut(n.as_u64().unwrap_or(0) as usize),
+                        Value::String(sid) => it.effects.iter_mut().find(|e| &e.effect == sid),
+                        _ => None,
+                    }
+                    .ok_or_else(|| bad("effects.deleteKeyframes", "no such effect"))?;
+                    let holder = json!({"mask": mask});
+                    let prm = crate::masks::target_param(e, &holder, param).ok_or_else(|| bad("effects.deleteKeyframes", "no such param"))?;
+                    if !prm.keyframes.iter().any(|k| k.time == *time) {
+                        return Err(bad("effects.deleteKeyframes", "keyframe does not exist").into());
+                    }
+                }
+                for (clip, eff, mask, param, time) in &targets {
+                    let (_, it) = q.find_item_mut(*clip).ok_or(filmcraft_edit::EditError::NoItem(*clip))?;
+                    let e = match eff {
+                        Value::Number(n) => it.effects.get_mut(n.as_u64().unwrap_or(0) as usize),
+                        Value::String(sid) => it.effects.iter_mut().find(|e| &e.effect == sid),
+                        _ => None,
+                    }
+                    .ok_or_else(|| bad("effects.deleteKeyframes", "no such effect"))?;
+                    let holder = json!({"mask": mask});
+                    let prm = crate::masks::target_param(e, &holder, param).ok_or_else(|| bad("effects.deleteKeyframes", "no such param"))?;
+                    prm.remove_keyframe_at(*time);
+                }
+                Ok(())
+            })?;
+            Ok(json!({"deleted": targets.len()}))
+        }),
         CommandSpec {
             id: "effects.select",
             label: "Select Effect",
@@ -3104,9 +3177,14 @@ fn build() -> Vec<CommandSpec> {
             "Keyframe Interpolation",
             [],
             None,
-            r#"{"clip":id,"effect":str|index,"param":str,"mediaTime":ticks,"interpolation":"linear|bezier|autoBezier|continuousBezier|hold|easeIn|easeOut"}"#,
+            r#"{"clip":id,"effect":str|index,"param":str,"mediaTime":ticks,"interpolation":"linear|bezier|autoBezier|continuousBezier|hold|easeIn|easeOut"}|{"keyframes":[{"clip":id,"effect":index|id,"param":str,"mask":n?,"time":mediaTicks}],"interpolation":…}"#,
             has_seq,
-            |s, p| keyframe_op(s, p, "interp")
+            |s, p| {
+                if p.get("keyframes").and_then(Value::as_array).is_some() {
+                    return set_interpolation_many(s, p);
+                }
+                keyframe_op(s, p, "interp")
+            }
         ),
         cmd!(
             "effects.setKeyframe",
@@ -3342,8 +3420,67 @@ fn reset_params(e: &mut filmcraft_project::EffectInstance, only: Option<&str>, f
     any
 }
 
-fn keyframe_op(s: &mut Session, p: &Value, op: &str) -> Result<Value> {
-    let c = clip_p(p, "clip").ok_or_else(|| bad("keyframe", "need `clip`"))?;
+/// `effects.setInterpolation` with `keyframes`: one interpolation for a whole selection,
+/// one undo step. Missing keyframes fail the call without changing anything.
+fn set_interpolation_many(s: &mut Session, p: &Value) -> Result<Value> {
+    const CMD: &str = "effects.setInterpolation";
+    let keys = p.get("keyframes").and_then(Value::as_array).ok_or_else(|| bad(CMD, "need `keyframes`"))?;
+    if keys.is_empty() {
+        return Err(bad(CMD, "need at least one keyframe"));
+    }
+    let kind = match str_p(p, "interpolation").unwrap_or("linear").to_ascii_lowercase().as_str() {
+        "bezier" => filmcraft_project::Interpolation::Bezier,
+        "autobezier" => filmcraft_project::Interpolation::AutoBezier,
+        "continuousbezier" => filmcraft_project::Interpolation::ContinuousBezier,
+        "hold" => filmcraft_project::Interpolation::Hold,
+        "easein" => filmcraft_project::Interpolation::EaseIn,
+        "easeout" => filmcraft_project::Interpolation::EaseOut,
+        _ => filmcraft_project::Interpolation::Linear,
+    };
+    let targets = keys
+        .iter()
+        .map(|k| {
+            let clip = k.get("clip").and_then(Value::as_u64).map(ClipId).ok_or_else(|| bad(CMD, "each keyframe needs `clip`"))?;
+            let param = k.get("param").and_then(Value::as_str).ok_or_else(|| bad(CMD, "each keyframe needs `param`"))?.to_string();
+            let time = k.get("time").and_then(Value::as_i64).map(Tick).ok_or_else(|| bad(CMD, "each keyframe needs `time`"))?;
+            Ok((clip, k.get("effect").cloned().unwrap_or(json!("motion")), k.get("mask").cloned().unwrap_or(Value::Null), param, time))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    s.edit_sequence("Keyframe Interpolation", |q, _, _| {
+        for (clip, eff, mask, param, time) in &targets {
+            let (_, it) = q.find_item_mut(*clip).ok_or(filmcraft_edit::EditError::NoItem(*clip))?;
+            let e = match eff {
+                Value::Number(n) => it.effects.get_mut(n.as_u64().unwrap_or(0) as usize),
+                Value::String(sid) => it.effects.iter_mut().find(|e| &e.effect == sid),
+                _ => None,
+            }
+            .ok_or_else(|| bad(CMD, "no such effect"))?;
+            let holder = json!({"mask": mask});
+            let prm = crate::masks::target_param(e, &holder, param).ok_or_else(|| bad(CMD, "no such param"))?;
+            if !prm.keyframes.iter().any(|k| k.time == *time) {
+                return Err(bad(CMD, "keyframe does not exist").into());
+            }
+        }
+        for (clip, eff, mask, param, time) in &targets {
+            let (_, it) = q.find_item_mut(*clip).ok_or(filmcraft_edit::EditError::NoItem(*clip))?;
+            let e = match eff {
+                Value::Number(n) => it.effects.get_mut(n.as_u64().unwrap_or(0) as usize),
+                Value::String(sid) => it.effects.iter_mut().find(|e| &e.effect == sid),
+                _ => None,
+            }
+            .ok_or_else(|| bad(CMD, "no such effect"))?;
+            let holder = json!({"mask": mask});
+            let prm = crate::masks::target_param(e, &holder, param).ok_or_else(|| bad(CMD, "no such param"))?;
+            if let Some(k) = prm.keyframes.iter_mut().find(|k| k.time == *time) {
+                k.interp = kind;
+            }
+        }
+        Ok(())
+    })?;
+    Ok(json!({"updated": targets.len()}))
+}
+
+fn keyframe_op(s: &mut Session, p: &Value, op: &str) -> Result<Value> {    let c = clip_p(p, "clip").ok_or_else(|| bad("keyframe", "need `clip`"))?;
     let pid = str_p(p, "param").ok_or_else(|| bad("keyframe", "need `param`"))?.to_string();
     let eff = p.get("effect").cloned().unwrap_or(json!("motion"));
     let ph = time_p(s, p, "").unwrap_or(s.playhead());

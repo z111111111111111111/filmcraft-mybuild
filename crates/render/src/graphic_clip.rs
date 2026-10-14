@@ -60,7 +60,11 @@ pub fn text_styles(t: &TextProps) -> (TextStyle, ParagraphStyle) {
             leading: t.leading,
             width: (t.box_width > 0.0 && !t.vertical).then_some(t.box_width),
             height: (t.box_width > 0.0 && t.box_height > 0.0 && !t.vertical).then_some(t.box_height),
-            rtl: None,
+            rtl: match t.dir {
+                1 => Some(false),
+                2 => Some(true),
+                _ => None,
+            },
             vertical: t.vertical,
         },
     )

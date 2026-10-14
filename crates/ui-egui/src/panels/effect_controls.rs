@@ -28,7 +28,17 @@ const CLIP_BAR_H: f32 = 18.0;
 const NAV_STEP: f32 = 16.0;
 /// The Y curve of a point parameter's value graph (X uses the accent colour).
 const Y_CURVE: Color32 = Color32::from_rgb(0x60, 0xc0, 0x80);
-/// Properties panel: the keyframe diamonds' column, from a row's right edge (the arrows sit one
+/// A standard effect header being dragged onto another to reorder: Motion, Opacity and the
+/// other fixed effects stay where they are, standard effects behave like layers.
+#[derive(Clone, Default)]
+struct ReorderDrag {
+    clip: u64,
+    from: usize,
+    target: Option<usize>,
+}
+fn reorder_drag_id() -> egui::Id {
+    egui::Id::new("effect-controls-reorder")
+}/// Properties panel: the keyframe diamonds' column, from a row's right edge (the arrows sit one
 /// [`NAV_STEP`] to either side of it, and a section's reset button above it).
 const PROPS_NAV_X: f32 = 26.0;
 /// Properties panel: where a row's value fields end, left of the navigator.
@@ -176,7 +186,7 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
                 let key = format!("{}:{}", clip.0, idx);
                 let open = !app.ui.collapsed_fx.contains(&key);
                 let selected = app.session.state.selected_effect.as_ref().is_some_and(|s| s.clip == clip && s.index(&it.effects) == Some(idx));
-                let (r, resp) = bui.allocate_exact_size(vec2(body.width(), ROW_H), Sense::click());
+                let (r, resp) = bui.allocate_exact_size(vec2(body.width(), ROW_H), Sense::click_and_drag());
                 if selected {
                     bui.painter().rect_filled(crate::panels::effect_controls::row_fill(r), 0.0, t.row_selected);
                 } else if resp.hovered() {
@@ -208,6 +218,53 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
                     actions.push(("effects.reset".into(), json!({"clip": clip.0, "index": idx})));
                 }
                 app.auto.add(&format!("effectControls.effect.{}", e.effect), r, def.name);
+                // standard effects reorder by dragging the header onto another standard effect;
+                // fixed effects (Motion, Opacity, …) are not drag sources nor drop targets
+                if !def.intrinsic {
+                    if resp.drag_started_by(egui::PointerButton::Primary) {
+                        bui.data_mut(|d| d.insert_temp(reorder_drag_id(), ReorderDrag { clip: clip.0, from: idx, target: None }));
+                    }
+                    let dragging = bui.data(|d| d.get_temp::<ReorderDrag>(reorder_drag_id())).filter(|rd| rd.clip == clip.0 && rd.from != idx);
+                    if dragging.is_some()
+                        && let Some(pos) = bui.input(|i| i.pointer.interact_pos())
+                        && r.contains(pos)
+                    {
+                        let from = dragging.map(|rd| rd.from).unwrap_or(idx);
+                        bui.data_mut(|d| {
+                            if let Some(mut rd) = d.get_temp::<ReorderDrag>(reorder_drag_id()) {
+                                rd.target = Some(idx);
+                                d.insert_temp(reorder_drag_id(), rd);
+                            }
+                        });
+                        // insertion line: above the row when moving up, below it when moving down
+                        let y = if idx < from { r.min.y + 1.0 } else { r.max.y - 1.0 };
+                        bui.painter().line_segment([pos2(r.min.x + 30.0, y), pos2(r.max.x - 8.0, y)], Stroke::new(2.0, t.accent));
+                    }
+                    app.auto.add(&format!("effectControls.effect.{}.grip", e.effect), r, def.name);
+                    if resp.drag_stopped_by(egui::PointerButton::Primary) {
+                        let rd = bui.data(|d| d.get_temp::<ReorderDrag>(reorder_drag_id()));
+                        bui.data_mut(|d| d.remove::<ReorderDrag>(reorder_drag_id()));
+                        if let Some(rd) = rd.filter(|rd| rd.clip == clip.0 && rd.from == idx)
+                            && let Some(to) = rd.target
+                            && to != rd.from
+                        {
+                            actions.push(("effects.reorder".into(), json!({"clip": clip.0, "from": rd.from, "to": to})));
+                            // keyframe selection holds effect indices: follow the moved effect
+                            for k in app.ui.keyframe_selection.iter_mut().filter(|k| k.clip == clip.0) {
+                                if k.effect == rd.from {
+                                    k.effect = to;
+                                } else if rd.from < to && (rd.from + 1..=to).contains(&k.effect) {
+                                    k.effect -= 1;
+                                } else if to < rd.from && (to..rd.from).contains(&k.effect) {
+                                    k.effect += 1;
+                                }
+                            }
+                        }
+                    }
+                    if bui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                        bui.data_mut(|d| d.remove::<ReorderDrag>(reorder_drag_id()));
+                    }
+                }
                 if twresp.clicked() {
                     if open {
                         app.ui.collapsed_fx.push(key.clone());
@@ -615,6 +672,57 @@ pub(crate) fn param_row(
         (ParamKind::Path, _) => {
             crate::panels::masks::path_value(app, &mut vui, clip, idx, mask, actions);
         }
+        (ParamKind::Text, ParamValue::Text(s)) if pd.id == "font" && mask.is_none() => {
+            // a font picker, not a name field: the installed families, like Properties shows
+            if !filmcraft_text::fonts::system_scanned() {
+                filmcraft_text::fonts::scan_system();
+            }
+            let fams = filmcraft_text::families();
+            let r = egui::ComboBox::from_id_salt(id)
+                .selected_text(s.as_str())
+                .width(vui.available_width().min(170.0))
+                .height(400.0)
+                .show_ui(&mut vui, |ui| {
+                    for (f, _) in &fams {
+                        if ui.selectable_label(*f == *s, f).clicked() {
+                            set = Some(json!(f));
+                        }
+                    }
+                });
+            app.auto.add(&format!("effectControls.text.{idx}.{}", pd.id), r.response.rect, pd.label);
+        }
+        (ParamKind::Text, ParamValue::Text(s)) if pd.id == "font_style" && mask.is_none() => {
+            // the styles of the layer's family (plus synthetic ones), like Properties shows
+            let family = e.params.get("font").and_then(|p| match &p.value {
+                ParamValue::Text(f) => Some(f.clone()),
+                _ => None,
+            });
+            let styles: Vec<String> = family
+                .as_deref()
+                .and_then(|fam| filmcraft_text::families().into_iter().find(|(f, _)| f.eq_ignore_ascii_case(fam)).map(|(_, st)| st))
+                .unwrap_or_default();
+            let r = egui::ComboBox::from_id_salt(id)
+                .selected_text(s.as_str())
+                .width(vui.available_width().min(170.0))
+                .show_ui(&mut vui, |ui| {
+                    for st in styles.iter().map(String::as_str).chain(["Bold", "Italic", "Bold Italic"]).filter({
+                        let mut seen = Vec::new();
+                        move |x: &&str| {
+                            if seen.contains(x) {
+                                false
+                            } else {
+                                seen.push(*x);
+                                true
+                            }
+                        }
+                    }) {
+                        if ui.selectable_label(st == s.as_str(), st).clicked() {
+                            set = Some(json!(st));
+                        }
+                    }
+                });
+            app.auto.add(&format!("effectControls.text.{idx}.{}", pd.id), r.response.rect, pd.label);
+        }
         (ParamKind::Text, ParamValue::Text(s)) if !pd.id.ends_with("_lut") => {
             // edited in a buffer; committed (one undo step) when the field loses focus
             let mut buf = vui.data_mut(|d| d.get_temp::<String>(id)).unwrap_or_else(|| s.clone());
@@ -687,11 +795,23 @@ pub(crate) fn param_row(
     }
 }
 
+/// Whether `k` names a keyframe on its clip in the active sequence.
+fn keyframe_exists_in(app: &FilmcraftApp, k: &KeyframeRef) -> bool {
+    app.session
+        .active_sequence()
+        .and_then(|q| q.find_item(ClipId(k.clip)))
+        .is_some_and(|(_, it)| keyframe_exists(it, k))
+}
+
 /// Shared by the lane diamonds and graph points: commands use media time and preserve the mask.
+/// When the target belongs to a multi-keyframe selection, interpolation and Clear apply to the
+/// whole selection (one undo step); otherwise they apply to the one keyframe.
 fn keyframe_menu(app: &mut FilmcraftApp, ui: &mut egui::Ui, target: KeyframeRef, actions: &mut Vec<(String, Value)>) {
-    let mut params = json!({"clip": target.clip, "effect": target.effect, "param": target.param, "mediaTime": target.time.0});
+    let selected: Vec<KeyframeRef> = app.ui.keyframe_selection.iter().filter(|k| keyframe_exists_in(app, k)).cloned().collect();
+    let group = (selected.len() > 1 && selected.contains(&target)).then_some(selected);
+    let mut single = json!({"clip": target.clip, "effect": target.effect, "param": target.param, "mediaTime": target.time.0});
     if let Some(mask) = target.mask {
-        params["mask"] = json!(mask);
+        single["mask"] = json!(mask);
     }
     ui.label(egui::RichText::new(tl!("Temporal Interpolation")).color(app.tokens.text_dim));
     for (label, key) in [
@@ -706,9 +826,16 @@ fn keyframe_menu(app: &mut FilmcraftApp, ui: &mut egui::Ui, target: KeyframeRef,
         let response = ui.button(label);
         app.auto.add(&format!("effectControls.keyframeMenu.{key}"), response.rect, label);
         if response.clicked() {
-            let mut params = params.clone();
-            params["interpolation"] = json!(key);
-            actions.push(("effects.setInterpolation".into(), params));
+            if let Some(keys) = &group {
+                actions.push((
+                    "effects.setInterpolation".into(),
+                    json!({"keyframes": keys.iter().map(keyframe_json).collect::<Vec<_>>(), "interpolation": key}),
+                ));
+            } else {
+                let mut params = single.clone();
+                params["interpolation"] = json!(key);
+                actions.push(("effects.setInterpolation".into(), params));
+            }
             ui.close();
         }
     }
@@ -716,9 +843,22 @@ fn keyframe_menu(app: &mut FilmcraftApp, ui: &mut egui::Ui, target: KeyframeRef,
     let response = ui.button(tl!("Clear"));
     app.auto.add("effectControls.keyframeMenu.clear", response.rect, "Clear");
     if response.clicked() {
-        actions.push(("effects.deleteKeyframe".into(), params));
+        if let Some(keys) = group {
+            actions.push(("effects.deleteKeyframes".into(), json!({"keyframes": keys.iter().map(keyframe_json).collect::<Vec<_>>()})));
+        } else {
+            actions.push(("effects.deleteKeyframe".into(), single));
+        }
         ui.close();
     }
+}
+
+/// A [`KeyframeRef`] as the `keyframes` entry the bulk engine commands take.
+fn keyframe_json(k: &KeyframeRef) -> Value {
+    let mut v = json!({"clip": k.clip, "effect": k.effect, "param": k.param, "time": k.time.0});
+    if let Some(mask) = k.mask {
+        v["mask"] = json!(mask);
+    }
+    v
 }
 
 /// Lumetri Color panel: edits (or adds) the Lumetri effect on the selected clip, grouped by section.

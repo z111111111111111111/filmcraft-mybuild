@@ -671,3 +671,49 @@ fn move_to_new_track_adds_it_in_one_undo_step() {
     assert_eq!(*s.active_sequence().unwrap(), before);
     assert_eq!(s.history.undo.len(), undo);
 }
+
+/// Naming a track past the last one grows the timeline: sequences still start at three video
+/// and three audio tracks, but placing or moving onto V5/A5 adds the missing tracks instead of
+/// failing, as one undo step; undo takes them away again.
+#[test]
+fn naming_a_higher_track_adds_the_missing_tracks() {
+    let (mut s, item) = fresh();
+    assert_eq!(s.active_sequence().unwrap().video_tracks.len(), 3);
+    assert_eq!(s.active_sequence().unwrap().audio_tracks.len(), 3);
+    let undo = s.history.undo.len();
+    let before = s.active_sequence().unwrap().clone();
+    let clips = place(&mut s, item, "V5", 0, 0, 10);
+    let q = s.active_sequence().unwrap();
+    assert_eq!(q.video_tracks.len(), 5, "V4 and V5 were added");
+    assert_eq!(q.audio_tracks.len(), 5, "A4 and A5 were added");
+    assert_eq!(q.video_tracks[3].name, "Video 4");
+    assert_eq!(q.video_tracks[4].name, "Video 5");
+    assert_eq!(q.video_tracks[4].items.iter().map(|i| i.id.0).collect::<Vec<_>>(), [clips[0]]);
+    assert_eq!(s.history.undo.len(), undo + 1, "one undo step");
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(*s.active_sequence().unwrap(), before);
+
+    // existing tracks keep working with no growth and no extra undo step
+    let undo = s.history.undo.len();
+    place(&mut s, item, "V2", 0, 0, 10);
+    assert_eq!(s.active_sequence().unwrap().video_tracks.len(), 3);
+    assert_eq!(s.history.undo.len(), undo + 1);
+
+    // moving past the top track grows it too
+    let clips = place(&mut s, item, "V1", 0, 0, 10);
+    let undo = s.history.undo.len();
+    s.execute("timeline.move", json!({"moves": [{"clip": clips[0], "track": "V4", "time": 0}], "linked": false})).unwrap();
+    let q = s.active_sequence().unwrap();
+    assert_eq!(q.video_tracks.len(), 4);
+    assert!(q.video_tracks[3].items.iter().any(|i| i.id.0 == clips[0]));
+    assert_eq!(s.history.undo.len(), undo + 1, "one undo step");
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(s.active_sequence().unwrap().video_tracks.len(), 3);
+
+    // past the limit is still an error, and a failed move leaves no empty tracks behind
+    let undo = s.history.undo.len();
+    let before = s.active_sequence().unwrap().clone();
+    assert!(s.execute("timeline.move", json!({"moves": [{"clip": clips[0], "track": "V1000", "time": 0}], "linked": false})).is_err());
+    assert_eq!(*s.active_sequence().unwrap(), before);
+    assert_eq!(s.history.undo.len(), undo);
+}

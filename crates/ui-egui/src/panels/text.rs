@@ -468,6 +468,23 @@ fn style_strip(app: &mut FilmcraftApp, ui: &mut egui::Ui, r: Rect, track_idx: us
                 actions.push(("captions.setStyle".into(), json!({"track": tr.id.0, "align": name})));
             }
         }
+        ui.label(egui::RichText::new(tl!("Direction")).size(11.0).color(app.tokens.text_dim));
+        for (d, icon_txt, name, tip) in [
+            (
+                filmcraft_project::CaptionDir::Auto,
+                "A",
+                "auto",
+                tl!("Auto (follows the first strong character)"),
+            ),
+            (filmcraft_project::CaptionDir::Ltr, "L", "ltr", tl!("Left to Right")),
+            (filmcraft_project::CaptionDir::Rtl, "R", "rtl", tl!("Right to left")),
+        ] {
+            let resp = ui.selectable_label(st.dir == d, icon_txt).on_hover_text(tip);
+            app.auto.add(&format!("text.captions.style.dir.{name}"), resp.rect, name);
+            if resp.clicked() {
+                actions.push(("captions.setStyle".into(), json!({"track": tr.id.0, "dir": name})));
+            }
+        }
         ui.label(egui::RichText::new(tl!("Position")).size(11.0).color(app.tokens.text_dim));
         for (a, name, tip) in [
             (CaptionAnchor::Top, "top", tl!("Position: top")),

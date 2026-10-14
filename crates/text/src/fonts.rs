@@ -22,6 +22,8 @@ pub static INTER_BOLD: &[u8] = include_bytes!("../../../assets/fonts/Inter-Bold.
 pub static INTER_ITALIC: &[u8] = include_bytes!("../../../assets/fonts/Inter-Italic.ttf");
 pub static JETBRAINS_MONO_REGULAR: &[u8] = include_bytes!("../../../assets/fonts/JetBrainsMono-Regular.ttf");
 pub static NOTO_SERIF_REGULAR: &[u8] = include_bytes!("../../../assets/fonts/NotoSerif-Regular.ttf");
+pub static NOTO_SANS_ARABIC_REGULAR: &[u8] = include_bytes!("../../../assets/fonts/NotoSansArabic-Regular.ttf");
+pub static NOTO_SANS_ARABIC_BOLD: &[u8] = include_bytes!("../../../assets/fonts/NotoSansArabic-Bold.ttf");
 
 /// A font from the optional craft-fonts build input (empty unless built with `CRAFT_FONTS_DIR`; see
 /// `build.rs` and storytold/craft-fonts `docs/integration.md`).
@@ -215,6 +217,10 @@ impl Face {
     pub fn has_char(&self, c: char) -> bool {
         self.glyph(c).is_some()
     }
+    /// Whether this face is backed by a file on disk (a system font not yet loaded).
+    pub fn data_is_file(&self) -> bool {
+        matches!(self.info.data, FaceData::File(_))
+    }
     /// Whether the face covers every character of `text`. Unlike [`Face::has_char`], a face whose
     /// file is not loaded yet is read into a temporary buffer that is dropped afterwards, so
     /// probing many system faces does not keep every font file in memory.
@@ -286,7 +292,17 @@ fn db() -> &'static RwLock<Db> {
     static DB: OnceLock<RwLock<Db>> = OnceLock::new();
     DB.get_or_init(|| {
         let mut db = Db { faces: Vec::new(), scanned: false };
-        for b in [INTER_REGULAR, INTER_MEDIUM, INTER_SEMIBOLD, INTER_BOLD, INTER_ITALIC, JETBRAINS_MONO_REGULAR, NOTO_SERIF_REGULAR] {
+        for b in [
+            INTER_REGULAR,
+            INTER_MEDIUM,
+            INTER_SEMIBOLD,
+            INTER_BOLD,
+            INTER_ITALIC,
+            JETBRAINS_MONO_REGULAR,
+            NOTO_SERIF_REGULAR,
+            NOTO_SANS_ARABIC_REGULAR,
+            NOTO_SANS_ARABIC_BOLD,
+        ] {
             for n in read_faces_bytes(b) {
                 push(&mut db, info_from(n, FaceData::Static(b), "bundled"));
             }
@@ -459,19 +475,26 @@ fn is_serif(family: &str) -> bool {
     (f.contains("serif") && !f.contains("sans")) || f.contains("mincho")
 }
 
-/// A face that covers `c`, preferring `prefer`; bundled, craft-fonts and already-registered faces
+/// A face that covers `c`, preferring `prefer`; bundled, craft-fonts and installed faces
 /// are searched, in that order.
+///
+/// Bundled faces are cheap (compiled in), so they are checked first with a weight/italic
+/// preference: regular text finds Noto Sans Arabic Regular, bold text finds its Bold.
+/// Craft-fonts (Japanese) keep their serif/Gothic preference. Installed system faces are
+/// scanned on first need and probed via [`Face::covers_text`] (name tables only, no caching),
+/// so Arabic/Hebrew/CJK text finds a real face even when nothing is loaded yet.
 pub fn fallback_for(c: char, prefer: FaceId) -> FaceId {
     let p = face(prefer);
     if p.has_char(c) || c.is_control() {
         return prefer;
     }
     let faces = all_faces();
-    // prefer a face of the same italic-ness that is bundled (cheap), then anything loaded already
-    for f in faces.iter().filter(|f| f.info.origin == "bundled") {
-        if f.has_char(c) {
-            return f.id;
-        }
+    // Bundled faces first (cheap): nearest weight, same italic-ness preferred. This is what
+    // makes Arabic work out of the box via Noto Sans Arabic Regular/Bold.
+    let mut bundled: Vec<&Arc<Face>> = faces.iter().filter(|f| f.info.origin == "bundled" && f.has_char(c)).collect();
+    if !bundled.is_empty() {
+        bundled.sort_by_key(|f| (f.info.italic != p.info.italic, f.info.weight.abs_diff(p.info.weight)));
+        return bundled[0].id;
     }
     // then the craft-fonts faces (Japanese): Mincho for serif text, Gothic otherwise, nearest weight
     let serif = is_serif(&p.info.family);
@@ -482,9 +505,27 @@ pub fn fallback_for(c: char, prefer: FaceId) -> FaceId {
             return f.id;
         }
     }
-    for f in faces.iter().filter(|f| f.info.origin != "bundled" && f.bytes.get().is_some()) {
+    // already-loaded faces (e.g. fonts added via `add_font_data` on the web)
+    for f in faces.iter().filter(|f| f.info.origin != "bundled" && f.info.origin != CRAFT_ORIGIN && f.bytes.get().is_some()) {
         if f.has_char(c) {
             return f.id;
+        }
+    }
+    // installed system faces: scan once, then probe name tables without keeping bytes.
+    // `covers_text` reads the file into a temporary buffer, so probing many faces is cheap.
+    if !cfg!(target_arch = "wasm32") {
+        scan_system();
+        let faces = all_faces();
+        let mut sys: Vec<&Arc<Face>> = faces
+            .iter()
+            .filter(|f| f.info.origin == "system" && f.data_is_file() && f.covers_text(&c.to_string()))
+            .collect();
+        if !sys.is_empty() {
+            sys.sort_by_key(|f| (f.info.italic != p.info.italic, f.info.weight.abs_diff(p.info.weight)));
+            // touch the winner so its bytes are loaded for shaping
+            let id = sys[0].id;
+            let _ = face(id).has_char(c);
+            return id;
         }
     }
     prefer
@@ -602,5 +643,31 @@ mod tests {
         assert!(f.data().is_some());
         assert!(f.bytes.get().is_some());
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// Bundled Arabic faces cover the script and serve fallback without a system scan.
+    #[test]
+    fn bundled_arabic_covers_arabic() {
+        let fams = families();
+        let arabic = fams.iter().find(|(f, _)| f == "Noto Sans Arabic").expect("Noto Sans Arabic bundled");
+        assert!(arabic.1.iter().any(|x| x == "Regular"), "{:?}", arabic.1);
+        assert!(arabic.1.iter().any(|x| x == "Bold"), "{:?}", arabic.1);
+        const SAMPLE: &str = "ابتثجحخدذرزسشصضطظعغفقكلمنهويءآأؤإئةى،؟";
+        for c in SAMPLE.chars() {
+            assert!(face(resolve("Noto Sans Arabic", "Regular").face).has_char(c), "missing {c}");
+        }
+        // Inter lacks Arabic; fallback finds the bundled Arabic face by weight
+        let regular = resolve("Inter", "Regular").face;
+        let fb = face(fallback_for('ع', regular));
+        assert_eq!(fb.info.family, "Noto Sans Arabic", "{}", fb.info.family);
+        assert_eq!(fb.info.style, "Regular");
+        let bold = resolve("Inter", "Bold").face;
+        let fb_bold = face(fallback_for('ع', bold));
+        assert_eq!(fb_bold.info.family, "Noto Sans Arabic", "{}", fb_bold.info.family);
+        assert!(fb_bold.info.weight >= 600, "{} {}", fb_bold.info.family, fb_bold.info.style);
+        // laid out with real glyphs (no tofu)
+        let l = crate::layout("مرحبا بالعالم", &crate::TextStyle { size: 40.0, ..Default::default() }, &Default::default());
+        assert!(l.glyphs.iter().all(|g| g.id != 0), "{:?}", l.glyphs);
+        assert!(!l.missing_font, "Inter is missing but the fallback is not");
     }
 }

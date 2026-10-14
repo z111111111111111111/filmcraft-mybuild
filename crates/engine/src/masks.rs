@@ -1,4 +1,5 @@
-//! Effect masks: `masks.*` commands (add / remove / edit / select / list).
+//! Effect masks: `masks.*` commands (add / remove / edit / select / list / track /
+//! selectObject / selectHuman).
 //!
 //! A mask lives on an effect instance of a video clip (`effect`: index or id; Opacity masks cut
 //! out the clip itself). Commands address it with `clip` (default: the selected mask's clip, else
@@ -10,7 +11,7 @@
 //! key folds a continuous drag into one step).
 
 use filmcraft_geom::{Affine, Vec2};
-use filmcraft_project::{ClipId, EffectInstance, Mask, MaskMode, MaskPath, MaskVertex, ParamValue, TrackKind, TrackMethod};
+use filmcraft_project::{ClipId, EffectInstance, Mask, MaskMode, MaskPath, MaskVertex, Param, ParamValue, TrackKind, TrackMethod};
 use filmcraft_time::Tick;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -42,6 +43,18 @@ pub(crate) fn commands() -> Vec<CommandSpec> {
             add,
         ),
         spec("masks.remove", "Delete Mask", r#"{"clip":id?,"effect":index|id?,"mask":n?}"#, remove),
+        spec(
+            "masks.selectObject",
+            "Select Object",
+            r#"{"clip":id?,"effect":index|id?="opacity","point":[x,y]? (clip pixels: grow from here),"box":[x,y,w,h]? (clip pixels: grow from its centre; one of `point`/`box` is required),"tolerance":0..100?=25 (colour leeway),"feather":px?=0,"track":"forward"|"backward"? (track the new mask right away)}"#,
+            |s, p| select_subject(s, p, false),
+        ),
+        spec(
+            "masks.selectHuman",
+            "Select Human",
+            r#"{"clip":id?,"effect":index|id?="opacity","box":[x,y,w,h]? (clip pixels: drag around the person),"point":[x,y]? (clip pixels; one of `box`/`point` is required),"tolerance":0..100?=25,"feather":px?=2,"track":"forward"|"backward"|"none"?="forward" (the mask follows the person)}"#,
+            |s, p| select_subject(s, p, true),
+        ),
         spec(
             "masks.set",
             "Change Mask",
@@ -251,6 +264,147 @@ fn add(s: &mut Session, p: &Value) -> Result<Value> {
         Ok((ei, mi, name))
     })?;
     Ok(json!({"clip": clip.0, "effect": ei, "mask": mi, "name": name}))
+}
+
+/// Working width for object selection: full detail below it, scaled down above it (mask
+/// polygons do not need 4K source pixels, and flood fill is linear in pixels).
+const SELECT_MAX_WIDTH: f64 = 1440.0;
+
+/// Push a mask like [`add`] does, with a caller-chosen name prefix ("Object", "Human").
+/// Returns (effect index, mask index, name).
+fn push_mask(s: &mut Session, clip: ClipId, eff: Option<Value>, prefix: &str, path: MaskPath, feather: f64, label: &str) -> Result<(usize, usize, String)> {
+    let seq_id = s.state.active_sequence.ok_or(EngineError::NoSequence)?;
+    s.edit(label, move |pr, st| {
+        let q = pr.sequence_mut(seq_id).ok_or(EngineError::NoSequence)?;
+        let (_, it) = q.find_item_mut(clip).ok_or(filmcraft_edit::EditError::NoItem(clip))?;
+        let ei = effect_index(&it.effects, eff.as_ref(), None, clip).ok_or_else(|| bad(label, "no such effect on clip"))?;
+        let e = &mut it.effects[ei];
+        if e.def().is_none_or(|d| d.kind != filmcraft_project::EffectKind::Video) {
+            return Err(bad(label, "masks apply to video effects"));
+        }
+        if e.effect == "motion" {
+            return Err(bad(label, "Motion has no masks"));
+        }
+        let n = e
+            .masks
+            .iter()
+            .filter_map(|m| m.name.strip_prefix(prefix).and_then(|r| r.strip_prefix(" (")?.strip_suffix(')')?.parse::<usize>().ok()).or_else(|| (m.name == prefix).then_some(0)))
+            .max()
+            .unwrap_or(0)
+            + 1;
+        let name = format!("{prefix} ({n})");
+        let mut mask = Mask::new(name.clone(), path);
+        if feather > 0.0 {
+            mask.feather = filmcraft_project::Param::new(ParamValue::Float(feather));
+        }
+        e.masks.push(mask);
+        let mi = e.masks.len() - 1;
+        st.selected_mask = Some(MaskSel { clip, effect: ei, mask: mi });
+        st.selected_effect = None;
+        Ok((ei, mi, name))
+    })
+}
+
+/// Select an object (or a person) as an editable vector mask: grow the seed into its region,
+/// trace and simplify the boundary, add the mask, and optionally track it right away.
+///
+/// `human` only changes the preset: soft feather and tracking forward by default, like isolating
+/// a subject over a background. Automatic person detection without a seed is a subject-model
+/// follow-up; this command segments from the given `point` or `box` today.
+fn select_subject(s: &mut Session, p: &Value, human: bool) -> Result<Value> {
+    let cmd = if human { "masks.selectHuman" } else { "masks.selectObject" };
+    let clip = target_clip(s, p)?;
+    let seq = s.active_sequence().ok_or(EngineError::NoSequence)?;
+    let (_, it) = seq.find_item(clip).ok_or_else(|| bad(cmd, "no such clip"))?;
+    let it = it.clone();
+    let ph = time_p(s, p, "").unwrap_or(s.playhead());
+    let mt = it.source_time_at(ph.clamp(it.start, it.end() - Tick(1)));
+    let (sw, sh) = source_size(s, clip);
+    if sw < 1.0 || sh < 1.0 {
+        return Err(bad(cmd, "the clip has no picture"));
+    }
+    // seed in clip pixels: a point, or the centre of a box
+    let seed = match (p.get("point").and_then(pt), p.get("box")) {
+        (Some(q), None) => q,
+        (None, Some(b)) => {
+            let (x, y, w, h) = (b.get(0).and_then(Value::as_f64), b.get(1).and_then(Value::as_f64), b.get(2).and_then(Value::as_f64), b.get(3).and_then(Value::as_f64));
+            match (x, y, w, h) {
+                (Some(x), Some(y), Some(w), Some(h)) if w > 0.0 && h > 0.0 => Vec2::new(x + w / 2.0, y + h / 2.0),
+                _ => return Err(bad(cmd, "`box` is [x, y, w, h] in clip pixels with w, h > 0")),
+            }
+        }
+        _ => return Err(bad(cmd, "give exactly one of `point` ([x, y]) or `box` ([x, y, w, h])")),
+    };
+    if !(0.0..sw).contains(&seed.x) || !(0.0..sh).contains(&seed.y) {
+        return Err(bad(cmd, "the seed is outside the picture"));
+    }
+    let tolerance = match f64_p(p, "tolerance") {
+        Some(t) if !t.is_finite() || t < 0.0 || t > 100.0 => return Err(bad(cmd, "`tolerance` is 0..100")),
+        Some(t) => t,
+        None => 25.0,
+    };
+    // validated before anything changes: a bad `track` must not leave a mask behind
+    let track_dir: Option<String> = match str_p(p, "track") {
+        Some(d) => match d.to_ascii_lowercase().as_str() {
+            "forward" | "backward" => Some(d.to_ascii_lowercase()),
+            "none" => None,
+            other => return Err(bad(cmd, format!("`track`: forward, backward or none (got `{other}`)"))),
+        },
+        None => human.then_some("forward".to_string()),
+    };
+    let feather = match f64_p(p, "feather") {
+        Some(f) if !f.is_finite() || f < 0.0 => return Err(bad(cmd, "`feather` is pixels ≥ 0")),
+        Some(f) => f,
+        None => {
+            if human {
+                2.0
+            } else {
+                0.0
+            }
+        },
+    };
+    // decode at working size; flood fill is linear in pixels
+    let scale = (SELECT_MAX_WIDTH / sw.max(sh)).min(1.0) as f32;
+    let src = s.source(it.item).ok_or_else(|| bad(cmd, "the clip has no media to select from"))?;
+    let fr = src.video_frame(filmcraft_media::FrameRequest { time: mt, scale }).ok().ok_or_else(|| bad(cmd, "can't decode the frame at the playhead"))?;
+    let (fw, fh) = (fr.width as usize, fr.height as usize);
+    if fw == 0 || fh == 0 {
+        return Err(bad(cmd, "can't decode the frame at the playhead"));
+    }
+    let rgba = fr.to_rgba8();
+    let seed_f = (((seed.x / sw * fw as f64).round() as i64).clamp(0, fw as i64 - 1).max(0) as u32, ((seed.y / sh * fh as f64).round() as i64).clamp(0, fh as i64 - 1).max(0) as u32);
+    let threshold = (tolerance * 1.6).round().clamp(0.0, 255.0) as u8;
+    let poly = filmcraft_render::segment::object_polygon(&rgba, fw, fh, seed_f, threshold).map_err(|e| {
+        bad(
+            cmd,
+            match e {
+                filmcraft_render::segment::SegmentError::SeedOutside => "the seed is outside the picture",
+                filmcraft_render::segment::SegmentError::NothingFound => "nothing found there: click inside the object, or raise `tolerance`",
+                filmcraft_render::segment::SegmentError::TooComplex => "too much detail: raise `tolerance` to merge it",
+                filmcraft_render::segment::SegmentError::InvalidInput => "can't read the frame at the playhead",
+            },
+        )
+    })?;
+    // frame pixels → clip pixels
+    let (kx, ky) = (sw / fw as f64, sh / fh as f64);
+    let path = filmcraft_render::segment::polygon_to_path(&poly.iter().map(|(x, y)| (x * kx, y * ky)).collect::<Vec<_>>());
+    let vertices = path.len();
+    let eff = p.get("effect").cloned();
+    let prefix = if human { "Human" } else { "Object" };
+    let label = if human { "Select Human" } else { "Select Object" };
+    let (ei, mi, name) = push_mask(s, clip, eff, prefix, path, feather, label)?;
+    // optionally track the new mask right away (the analyze-then-track flow)
+    let tracking = match track_dir {
+        None => Value::Null,
+        Some(dir) => {
+            let tp = serde_json::json!({"clip": clip.0, "effect": ei, "mask": mi, "direction": dir});
+            match track(s, &tp) {
+                Ok(v) => v,
+                Err(e) => serde_json::json!({"error": e.to_string()}),
+            }
+        }
+    };
+    Ok(json!({"clip": clip.0, "effect": ei, "mask": mi, "name": name, "vertices": vertices, "track": tracking}))
 }
 
 fn remove(s: &mut Session, p: &Value) -> Result<Value> {

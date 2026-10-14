@@ -21,6 +21,7 @@ pub const TEXT_LAYER: &str = "graphic_text";
 pub const SHAPE_LAYER: &str = "graphic_shape";
 
 pub const ALIGN_OPTS: &[&str] = &["Left", "Center", "Right", "Justify"];
+pub const DIR_OPTS: &[&str] = &["Auto", "LeftToRight", "RightToLeft"];
 pub const CAPS_OPTS: &[&str] = &["Normal", "All Caps", "Small Caps"];
 pub const STROKE_OPTS: &[&str] = &["Outer", "Center", "Inner"];
 pub const SHAPE_OPTS: &[&str] = &["Rectangle", "Ellipse", "Polygon", "Path"];
@@ -120,6 +121,7 @@ pub(crate) fn layer_defs() -> Vec<EffectDef> {
                 tx("font_style", "Font Style", "Regular", false, X),
                 fl("size", "Font Size", 100.0, (1.0, 2000.0), (6.0, 400.0), "", X),
                 chc("align", "Alignment", ALIGN_OPTS, 0, X),
+                chc("dir", "Direction", DIR_OPTS, 0, X),
                 fl("tracking", "Tracking", 0.0, (-1000.0, 10_000.0), (-200.0, 1000.0), "", X),
                 bo("kerning", "Metrics Kerning", true, X),
                 bo("ligatures", "Ligatures", true, X),
@@ -200,6 +202,8 @@ pub struct TextProps {
     pub size: f32,
     /// 0 left, 1 centre, 2 right, 3 justify.
     pub align: u32,
+    /// 0 auto (first strong character), 1 left-to-right, 2 right-to-left.
+    pub dir: u32,
     pub tracking: f32,
     pub kerning: bool,
     pub ligatures: bool,
@@ -296,6 +300,7 @@ pub fn eval_layer(e: &EffectInstance, t: Tick, frame: (u32, u32)) -> Option<Laye
                 style: ss(e, "font_style", t),
                 size: ff(e, "size", t).max(0.1),
                 align: ch(e, "align", t),
+                dir: ch(e, "dir", t).min(2),
                 tracking: ff(e, "tracking", t),
                 kerning: bb(e, "kerning", t),
                 ligatures: bb(e, "ligatures", t),
@@ -424,7 +429,7 @@ pub fn new_vertical_text_layer(text: &str, position: Vec2, size: f64) -> EffectI
 /// Reset a layer's parameters to their defaults, keeping its content (name, text, shape kind,
 /// geometry and path) — Graphics ▸ Reset All Parameters.
 pub fn reset_layer_params(e: &mut EffectInstance) {
-    const KEEP: &[&str] = &["name", "text", "shape", "size", "sides", "points", "vertical", "box_width", "box_height"];
+    const KEEP: &[&str] = &["name", "text", "shape", "size", "sides", "points", "vertical", "box_width", "box_height", "dir"];
     let Some(def) = crate::effect::find_effect(&e.effect) else { return };
     let mut fresh = def.instance();
     for k in KEEP {

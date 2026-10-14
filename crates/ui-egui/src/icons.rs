@@ -122,6 +122,10 @@ pub enum Icon {
     Moon,
     /// Colour parameters: pick a colour from the Program monitor (a pipette).
     Eyedropper,
+    /// Object Select tool: a marquee box with a wand spark (original artwork).
+    ObjectSelect,
+    /// Human Select tool: a person silhouette (original artwork).
+    HumanSelect,
 }
 
 pub struct Pen16<'a> {
@@ -308,6 +312,17 @@ pub fn paint(painter: &Painter, rect: Rect, icon: Icon, color: Color32) {
         }
         Rectangle => pen.rect(2.5, 4.0, 13.5, 12.0),
         Ellipse => pen.circle(8.0, 8.0, 5.5),
+        ObjectSelect => {
+            pen.line(&[(2.5, 5.5), (2.5, 2.5), (5.5, 2.5)]);
+            pen.line(&[(10.5, 2.5), (13.5, 2.5), (13.5, 5.5)]);
+            pen.line(&[(13.5, 10.5), (13.5, 13.5), (10.5, 13.5)]);
+            pen.line(&[(5.5, 13.5), (2.5, 13.5), (2.5, 10.5)]);
+            pen.dot(8.0, 8.0, 1.3);
+        }
+        HumanSelect => {
+            pen.circle(8.0, 4.6, 2.2);
+            pen.fill(&[(4.8, 14.0), (5.6, 8.4), (10.4, 8.4), (11.2, 14.0)]);
+        }
         Hand => {
             pen.line(&[(5.0, 8.5), (5.0, 4.0), (6.5, 3.2), (7.3, 4.0), (7.3, 7.5)]);
             pen.line(&[(7.3, 4.0), (7.3, 2.8), (8.8, 2.2), (9.6, 3.0), (9.6, 7.5)]);

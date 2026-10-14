@@ -216,4 +216,44 @@ mod tests {
             }
         }
     }
+
+    /// One interpolation for a whole selection, then one delete for it: a marquee-selected group
+    /// takes the same properties together, each as one undo step.
+    #[test]
+    fn bulk_interpolation_and_delete_cover_a_selection() {
+        let (mut s, keys) = fixture();
+        let undo = s.history.undo.len();
+        s.execute("effects.setInterpolation", json!({"keyframes": keys, "interpolation": "hold"})).unwrap();
+        for k in &keys {
+            let at = k["time"].as_i64().unwrap();
+            assert!(
+                values(&s, k).iter().any(|kf| kf.time.0 == at && kf.interp == filmcraft_project::Interpolation::Hold),
+                "{k}"
+            );
+        }
+        assert_eq!(s.history.undo.len(), undo + 1, "one undo step");
+        let r = s.execute("effects.deleteKeyframes", json!({"keyframes": keys})).unwrap();
+        assert_eq!(r["deleted"].as_u64(), Some(3));
+        for k in &keys {
+            let at = k["time"].as_i64().unwrap();
+            assert!(values(&s, k).iter().all(|kf| kf.time.0 != at), "{k}");
+        }
+        assert_eq!(s.history.undo.len(), undo + 2, "one undo step each");
+        s.undo();
+        s.undo();
+        for k in &keys {
+            let at = k["time"].as_i64().unwrap();
+            assert!(values(&s, k).iter().any(|kf| kf.time.0 == at), "{k}");
+        }
+        // a missing keyframe fails the call with nothing changed
+        let before = s.project.clone();
+        let undo = s.history.undo.len();
+        let mut missing = keys.clone();
+        missing[0]["param"] = json!("missing");
+        assert!(s.execute("effects.deleteKeyframes", json!({"keyframes": missing})).is_err());
+        assert!(s.execute("effects.setInterpolation", json!({"keyframes": missing, "interpolation": "hold"})).is_err());
+        assert!(s.execute("effects.deleteKeyframes", json!({"keyframes": []})).is_err());
+        assert!(std::sync::Arc::ptr_eq(&before, &s.project));
+        assert_eq!(s.history.undo.len(), undo);
+    }
 }

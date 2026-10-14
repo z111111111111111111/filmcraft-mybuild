@@ -70,6 +70,42 @@ pub enum CaptionAnchor {
     Bottom,
 }
 
+/// Paragraph direction of a caption track.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum CaptionDir {
+    /// Follow the first strong character (Arabic/Hebrew → right-to-left).
+    #[default]
+    Auto,
+    Ltr,
+    Rtl,
+}
+
+impl CaptionDir {
+    pub fn from_name(s: &str) -> Option<CaptionDir> {
+        let n = s.to_ascii_lowercase().replace(['-', '_', ' '], "");
+        match n.as_str() {
+            "auto" => Some(CaptionDir::Auto),
+            "ltr" | "lefttoright" | "ltor" | "left" => Some(CaptionDir::Ltr),
+            "rtl" | "righttoleft" | "rtol" | "right" => Some(CaptionDir::Rtl),
+            _ => None,
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            CaptionDir::Auto => "auto",
+            CaptionDir::Ltr => "ltr",
+            CaptionDir::Rtl => "rtl",
+        }
+    }
+    pub fn as_rtl(self) -> Option<bool> {
+        match self {
+            CaptionDir::Auto => None,
+            CaptionDir::Ltr => Some(false),
+            CaptionDir::Rtl => Some(true),
+        }
+    }
+}
+
 /// Track-level caption style (Premiere's caption track style / Essential Graphics text settings).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -86,6 +122,9 @@ pub struct CaptionStyle {
     pub background_color: [u8; 4],
     pub align: CaptionAlign,
     pub anchor: CaptionAnchor,
+    /// Paragraph direction: auto follows the first strong character.
+    #[serde(default)]
+    pub dir: CaptionDir,
     /// Distance from the anchored frame edge, as a fraction of the frame height.
     pub margin: f32,
     /// Line height as a multiple of the font size.
@@ -105,6 +144,7 @@ impl Default for CaptionStyle {
             background_color: [0, 0, 0, 191],
             align: CaptionAlign::Center,
             anchor: CaptionAnchor::Bottom,
+            dir: CaptionDir::Auto,
             margin: 0.08,
             line_spacing: 1.25,
             outline: 0.0,

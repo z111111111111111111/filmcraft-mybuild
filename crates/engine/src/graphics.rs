@@ -207,6 +207,7 @@ fn param_id(k: &str) -> &str {
         "boxHeight" => "box_height",
         "anchorPoint" => "anchor",
         "cornerRadius" => "corner_radius",
+        "direction" => "dir",
         other => other,
     }
 }
@@ -216,15 +217,29 @@ pub(crate) fn to_param(template: &ParamValue, id: &str, v: &Value) -> Option<Par
     if let (ParamValue::Choice(_), Value::String(name)) = (template, v) {
         let opts: &[&str] = match id {
             "align" => graphic::ALIGN_OPTS,
+            "dir" => graphic::DIR_OPTS,
             "caps" => graphic::CAPS_OPTS,
             "stroke_type" | "stroke2_type" => graphic::STROKE_OPTS,
             "fill_kind" => graphic::FILL_KIND_OPTS,
             "shape" => SHAPE_OPTS,
             _ => &[],
         };
-        let n = name.to_ascii_lowercase().replace('_', " ");
-        let n = if n == "centre" { "center".to_string() } else { n };
-        return opts.iter().position(|o| o.to_ascii_lowercase() == n).map(|i| ParamValue::Choice(i as u32));
+        let mut n = name.to_ascii_lowercase().replace(['_', '-', ' '], "");
+        if n == "centre" {
+            n = "center".to_string();
+        }
+        // direction aliases: ltr/rtl, l-to-r, right-to-left…
+        if id == "dir" {
+            n = match n.as_str() {
+                "ltr" | "lefttoright" | "ltor" => "lefttoright".to_string(),
+                "rtl" | "righttoleft" | "rtol" => "righttoleft".to_string(),
+                _ => n,
+            };
+        }
+        return opts
+            .iter()
+            .position(|o| o.to_ascii_lowercase().replace(['_', '-', ' '], "") == n)
+            .map(|i| ParamValue::Choice(i as u32));
     }
     crate::commands::json_to_param(template, v)
 }
@@ -886,7 +901,7 @@ pub fn commands() -> Vec<CommandSpec> {
             "Text",
             &["Graphics and Titles", "New Layer"],
             Some("Cmd+T"),
-            r#"{"text":str="New Text","position":[x,y]? (point text: its alignment point on the first baseline; with `box`: the box's top-left corner),"box":[w,h]? (paragraph text wrapped in a box this size),"clip":id?,"newClip":bool?,"vertical":bool=false,"size":px=100,"font":str?,"fontStyle":str?,"seconds":f64=5,"track":index?,"time":ticks?}"#,
+            r#"{"text":str="New Text","position":[x,y]? (point text: its alignment point on the first baseline; with `box`: the box's top-left corner),"box":[w,h]? (paragraph text wrapped in a box this size),"clip":id?,"newClip":bool?,"vertical":bool=false,"size":px=100,"font":str?,"fontStyle":str?,"dir":"auto|ltr|rtl"=auto (paragraph direction; auto follows the first strong character),"seconds":f64=5,"track":index?,"time":ticks?}"#,
             has_seq,
             |s, p| {
                 let text = str_p(p, "text").unwrap_or("New Text").to_string();
@@ -911,6 +926,17 @@ pub fn commands() -> Vec<CommandSpec> {
                     if let Some(v) = str_p(p, k) {
                         layer.params.insert(id.into(), Param::new(ParamValue::Text(v.into())));
                     }
+                }
+                if let Some(d) = str_p(p, "dir").and_then(|d| {
+                    let n = d.to_ascii_lowercase().replace(['_', '-', ' '], "");
+                    match n.as_str() {
+                        "ltr" | "lefttoright" | "ltor" | "1" => Some(1u32),
+                        "rtl" | "righttoleft" | "rtol" | "2" => Some(2u32),
+                        "auto" | "0" => Some(0u32),
+                        _ => None,
+                    }
+                }) {
+                    layer.params.insert("dir".into(), Param::new(ParamValue::Choice(d)));
                 }
                 let into = if p.get("newClip").and_then(Value::as_bool) == Some(true) { None } else { u64_p(p, "clip").map(ClipId) };
                 let into = into.filter(|c| s.active_sequence().is_some_and(|q| is_graphic(s, q, *c)));

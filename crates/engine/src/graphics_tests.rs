@@ -658,3 +658,52 @@ fn a_layer_saved_before_the_box_height_existed_can_still_get_one() {
     s.execute("graphics.set", json!({"clip": clip.0, "props": {"box_height": 100}})).unwrap();
     assert_eq!(s.execute("graphics.list", json!({"clip": clip.0})).unwrap()["layers"][0]["box"], json!([500.0, 100.0]));
 }
+
+/// Standard effects reorder like layers by drag; fixed effects (Motion, Opacity, …) refuse to
+/// move, out-of-range indices fail, and everything is one undo step each.
+#[test]
+fn standard_effects_reorder_like_layers() {
+    let mut s = Session::default();
+    s.execute("file.newSequence", json!({"name": "Reorder"})).unwrap();
+    let bars = s.execute("file.newBarsAndTone", json!({"seconds": 5.0})).unwrap()["item"].as_u64().unwrap();
+    let r = s.execute("timeline.place", json!({"item": bars, "track": "V1", "seconds": 0.0})).unwrap();
+    let clip = ClipId(r["clips"][0].as_u64().unwrap());
+    s.execute("effects.apply", json!({"clips": [clip.0], "effect": "gaussian_blur"})).unwrap();
+    s.execute("effects.apply", json!({"clips": [clip.0], "effect": "lumetri"})).unwrap();
+    let order = || {
+        s.active_sequence().unwrap().find_item(clip).unwrap().1.effects.iter().map(|e| e.effect.clone()).collect::<Vec<_>>()
+    };
+    let intrinsic_at = || {
+        s.active_sequence()
+            .unwrap()
+            .find_item(clip)
+            .unwrap()
+            .1
+            .effects
+            .iter()
+            .position(|e| e.def().is_some_and(|d| d.intrinsic))
+            .unwrap()
+    };
+    let before = order();
+    let gi = before.iter().position(|e| e == "gaussian_blur").unwrap();
+    let li = before.iter().position(|e| e == "lumetri").unwrap();
+    assert!(gi < li, "{before:?}");
+    let undo = s.history.undo.len();
+    s.execute("effects.reorder", json!({"clip": clip.0, "from": li, "to": gi})).unwrap();
+    let after = order();
+    assert_eq!(after[gi], "lumetri");
+    assert_eq!(after[li], "gaussian_blur");
+    assert_eq!(after[intrinsic_at()], before[intrinsic_at()], "intrinsics stay");
+    assert_eq!(s.history.undo.len(), undo + 1, "one undo step");
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(order(), before);
+
+    // fixed effects refuse to move either way, and nothing changes
+    let mi = intrinsic_at();
+    let undo = s.history.undo.len();
+    assert!(s.execute("effects.reorder", json!({"clip": clip.0, "from": mi, "to": gi})).is_err());
+    assert!(s.execute("effects.reorder", json!({"clip": clip.0, "from": gi, "to": mi})).is_err());
+    assert!(s.execute("effects.reorder", json!({"clip": clip.0, "from": 99, "to": 0})).is_err());
+    assert_eq!(order(), before);
+    assert_eq!(s.history.undo.len(), undo);
+}

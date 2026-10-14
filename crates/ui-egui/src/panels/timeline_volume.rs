@@ -19,10 +19,11 @@ use super::timeline::{Layout, Row};
 use super::timeline_hit::EDGE_PX;
 use crate::FilmcraftApp;
 use crate::icons::{self, Icon};
-use crate::state::Tool;
+use crate::state::{KeyframeRef, Tool};
 use crate::theme::Tokens;
 
 const KEY_COL: Color32 = Color32::from_rgb(0xc8, 0xc8, 0xc8);
+const KEY_SEL_COL: Color32 = Color32::WHITE;
 
 /// Where the line goes in a clip drawn at `body`: under the name, down to the bottom edge.
 fn band(body: Rect) -> Rect {
@@ -84,8 +85,49 @@ fn keys(it: &TrackItem, body: Rect) -> Vec<(Tick, Pos2)> {
     p.keyframes.iter().map(|k| (k.time, pos2(x_of(it, body, timeline_time(it, k.time)), y_of(body, k.value.as_f64().unwrap_or(0.0))))).collect()
 }
 
-/// Draw the line over an audio clip drawn at `body`: white with a dark shadow.
-pub fn paint(p: &egui::Painter, body: Rect, it: &TrackItem) {
+/// Index of the clip's Volume effect (the lane this module edits), if it has one.
+fn volume_effect_index(it: &TrackItem) -> Option<usize> {
+    it.effects.iter().position(|e| e.effect == "volume")
+}
+
+/// The shared keyframe selection's reference for the Volume key at media time `time`.
+fn key_ref(clip: ClipId, it: &TrackItem, time: Tick) -> Option<KeyframeRef> {
+    volume_effect_index(it).map(|effect| KeyframeRef { clip: clip.0, effect, param: "level".into(), mask: None, time })
+}
+
+/// Whether the shared selection holds the Volume key at media time `time` on `it`.
+fn is_selected(sel: &[KeyframeRef], clip: ClipId, it: &TrackItem, time: Tick) -> bool {
+    let Some(idx) = volume_effect_index(it) else { return false };
+    sel.iter().any(|k| k.clip == clip.0 && k.effect == idx && k.param == "level" && k.mask.is_none() && k.time == time)
+}
+
+/// Volume keyframes of the audio clips in view whose diamonds fall in `r`: the timeline
+/// marquee unions these into the shared keyframe selection, like Effect Controls does.
+pub fn keys_in(seq: &Sequence, layout: &Layout, r: Rect) -> Vec<KeyframeRef> {
+    let mut out = Vec::new();
+    for row in layout.rows.iter().filter(|row| row.kind == TrackKind::Audio && !row.lane && row.rect.intersects(r)) {
+        let Some(tr) = seq.track(row.track).filter(|t| !t.locked) else { continue };
+        for it in &tr.items {
+            let body = body(layout, row, it);
+            if band(body).height() < 6.0 {
+                continue;
+            }
+            for (time, c) in keys(it, body) {
+                if r.contains(c)
+                    && let Some(k) = key_ref(it.id, it, time)
+                    && !out.contains(&k)
+                {
+                    out.push(k);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Draw the line over an audio clip drawn at `body`: white with a dark shadow. Selected
+/// keyframes draw white, the rest grey.
+pub fn paint(p: &egui::Painter, body: Rect, it: &TrackItem, sel: &[KeyframeRef]) {
     let vis = p.clip_rect().intersect(body);
     if band(body).height() < 6.0 || vis.width() <= 0.0 {
         return;
@@ -94,8 +136,9 @@ pub fn paint(p: &egui::Painter, body: Rect, it: &TrackItem) {
     let pts = line(it, body, vis.min.x, vis.max.x);
     p.add(egui::Shape::line(pts.iter().map(|q| *q + vec2(0.0, 1.0)).collect(), Stroke::new(1.0, Color32::BLACK)));
     p.add(egui::Shape::line(pts, Stroke::new(1.0, Color32::WHITE)));
-    for (_, c) in keys(it, body).into_iter().filter(|(_, c)| vis.expand(6.0).contains(*c)) {
-        icons::paint(&p, Rect::from_center_size(c, vec2(9.0, 9.0)), Icon::Keyframe, KEY_COL);
+    for (time, c) in keys(it, body).into_iter().filter(|(_, c)| vis.expand(6.0).contains(*c)) {
+        let col = if is_selected(sel, it.id, it, time) { KEY_SEL_COL } else { KEY_COL };
+        icons::paint(&p, Rect::from_center_size(c, vec2(9.0, 9.0)), Icon::Keyframe, col);
     }
 }
 
@@ -209,20 +252,64 @@ fn key_drag_id() -> egui::Id {
     egui::Id::new("tl-volume-key-drag")
 }
 
-/// The keyframes on the lines of the audio clips in view: drag one in time and level, right-click
-/// it to delete it. Runs after the timeline's own interaction, so they are above the clip.
+/// Volume keyframes dragged together on the timeline: the selection at press time, the
+/// pressed key's clip and timeline anchor. The move commits once on release through
+/// `effects.moveKeyframes` (time only, like an Effect Controls group drag); Escape cancels.
+#[derive(Clone)]
+struct GroupDrag {
+    keys: Vec<KeyframeRef>,
+    clip: ClipId,
+    anchor: Tick,
+}
+
+fn group_drag_id() -> egui::Id {
+    egui::Id::new("tl-volume-group-drag")
+}
+
+/// The pressed key as the bulk commands' `keyframes` entry.
+fn keyframe_json(k: &KeyframeRef) -> Value {
+    let mut v = json!({"clip": k.clip, "effect": k.effect, "param": k.param, "time": k.time.0});
+    if let Some(mask) = k.mask {
+        v["mask"] = json!(mask);
+    }
+    v
+}
+
+/// Whether a group drag is in progress (its anchor is the pressed key).
+fn group_held(ui: &egui::Ui) -> Option<GroupDrag> {
+    ui.data(|d| d.get_temp(group_drag_id()))
+}
+
+/// Whether `k` still names a keyframe on its clip in `seq` (bulk menus only offer living keys).
+fn key_alive(seq: &Sequence, k: &KeyframeRef) -> bool {
+    seq.find_item(ClipId(k.clip))
+        .and_then(|(_, it)| it.effects.get(k.effect))
+        .and_then(|e| match k.mask {
+            Some(m) => e.masks.get(m).and_then(|m| m.param(&k.param)),
+            None => e.params.get(&k.param),
+        })
+        .is_some_and(|p| p.keyframes.iter().any(|kf| kf.time == k.time))
+}
+
+/// The keyframes on the lines of the audio clips in view: click one to select it
+/// (Shift toggles), drag a box over them with the timeline marquee to select several, drag one
+/// of several to move them together in time, right-click for interpolation and delete. Runs
+/// after the timeline's own interaction, so they are above the clip.
 pub fn interact(app: &mut FilmcraftApp, ui: &mut egui::Ui, seq: &Sequence, layout: &Layout, aclip: Rect) {
     let held: Option<KeyDrag> = ui.data(|d| d.get_temp(key_drag_id()));
-    if held.is_some() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+    if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
         if let Some(h) = held
             && h.begun
         {
             let _ = app.session.execute("edit.undo", json!({}));
         }
-        ui.data_mut(|d| d.remove::<KeyDrag>(key_drag_id()));
+        ui.data_mut(|d| {
+            d.remove::<KeyDrag>(key_drag_id());
+            d.remove::<GroupDrag>(group_drag_id());
+        });
         return;
     }
-    if held.is_none() && (app.tl.drag.is_some() || !matches!(app.ui.tool, Tool::Selection | Tool::Pen)) {
+    if held.is_none() && group_held(ui).is_none() && (app.tl.drag.is_some() || !matches!(app.ui.tool, Tool::Selection | Tool::Pen)) {
         return;
     }
     let area = aclip.intersect(layout.content);
@@ -258,18 +345,57 @@ pub fn interact(app: &mut FilmcraftApp, ui: &mut egui::Ui, seq: &Sequence, layou
                 let kr = Rect::from_center_size(c, vec2(11.0, 11.0));
                 let resp = ui.interact(kr, egui::Id::new(("tl-volume-kf", it.id.0, i)), Sense::click_and_drag());
                 app.auto.add(&format!("timeline.clip.{}.volume.kf.{i}", it.id.0), kr, "Volume keyframe");
+                let rf = key_ref(it.id, it, time);
                 let mine = held.filter(|h| h.clip == it.id && h.index == i);
-                if resp.hovered() || mine.is_some() {
+                let grouped = group_held(ui).filter(|g| g.clip == it.id && g.keys.iter().any(|k| Some(k) == rf.as_ref()));
+                if resp.hovered() || mine.is_some() || grouped.is_some() {
                     icons::paint(&ui.painter().with_clip_rect(area), Rect::from_center_size(c, vec2(9.0, 9.0)), Icon::Keyframe, Color32::WHITE);
                     ui.ctx().set_cursor_icon(CursorIcon::Move);
                 }
+                let shift = ui.input(|i| i.modifiers.shift);
+                // click selects (Shift toggles), like the Effect Controls diamonds
+                if resp.clicked_by(egui::PointerButton::Primary)
+                    && let Some(rf) = rf.clone()
+                {
+                    if shift {
+                        if let Some(n) = app.ui.keyframe_selection.iter().position(|k| *k == rf) {
+                            app.ui.keyframe_selection.remove(n);
+                        } else {
+                            app.ui.keyframe_selection.push(rf);
+                        }
+                    } else {
+                        app.ui.keyframe_selection = vec![rf];
+                    }
+                }
                 if resp.drag_started()
                     && let Some(p) = pointer
+                    && let Some(rf) = rf.clone()
                 {
-                    next = Some(KeyDrag { clip: it.id, index: i, grab: p - c, begun: false });
+                    if !app.ui.keyframe_selection.contains(&rf) {
+                        if shift {
+                            app.ui.keyframe_selection.push(rf.clone());
+                        } else {
+                            app.ui.keyframe_selection = vec![rf.clone()];
+                        }
+                    }
+                    if app.ui.keyframe_selection.len() > 1 {
+                        // several selected: dragging one moves them together in time; the move
+                        // commits once on release, so the drag is one undo step
+                        ui.data_mut(|d| {
+                            d.remove::<KeyDrag>(key_drag_id());
+                            d.insert_temp(
+                                group_drag_id(),
+                                GroupDrag { keys: app.ui.keyframe_selection.clone(), clip: it.id, anchor: timeline_time(it, time) },
+                            );
+                        });
+                    } else {
+                        ui.data_mut(|d| d.remove::<GroupDrag>(group_drag_id()));
+                        next = Some(KeyDrag { clip: it.id, index: i, grab: p - c, begun: false });
+                    }
                 }
                 if let (Some(h), Some(p)) = (mine, pointer)
                     && resp.dragged()
+                    && group_held(ui).is_none()
                 {
                     let q = p - h.grab;
                     // on a frame, at least a frame away from the keyframes on either side
@@ -296,11 +422,71 @@ pub fn interact(app: &mut FilmcraftApp, ui: &mut egui::Ui, seq: &Sequence, layou
                     }
                     tip(ui, db);
                 }
+                // a group drag moves every selected keyframe together in time: live it shows the
+                // snapped delta, on release it commits once through `effects.moveKeyframes`
+                if let (Some(g), Some(p)) = (grouped, pointer) {
+                    let t = rate.snap_nearest(t_at(it, body, p.x));
+                    let delta = t - g.anchor;
+                    let frames = (delta.0 as f64 / rate.frame_duration().0.max(1) as f64).round() as i64;
+                    app.ui.status = if frames == 0 {
+                        format!("Move {} keyframes", g.keys.len())
+                    } else {
+                        format!("Move {} keyframes by {frames:+} frames", g.keys.len())
+                    };
+                    if resp.drag_stopped_by(egui::PointerButton::Primary) {
+                        ui.data_mut(|d| d.remove::<GroupDrag>(group_drag_id()));
+                        if delta != Tick::ZERO {
+                            match app.session.execute(
+                                "effects.moveKeyframes",
+                                json!({"keyframes": g.keys.iter().map(keyframe_json).collect::<Vec<_>>(), "delta": delta.0}),
+                            ) {
+                                Ok(result) => {
+                                    if let Ok(keys) = serde_json::from_value(result["keyframes"].clone()) {
+                                        app.ui.keyframe_selection = keys;
+                                    }
+                                }
+                                Err(error) => app.ui.status = error.to_string(),
+                            }
+                        }
+                    }
+                }
+                // the selection's reference for this diamond (for the menu below): the shared
+                // selection when this key belongs to a multi-selection, else just this key
+                let bulk: Option<Vec<KeyframeRef>> = rf.clone().and_then(|rf| {
+                    let sel: Vec<KeyframeRef> = app.ui.keyframe_selection.iter().filter(|k| key_alive(seq, k)).cloned().collect();
+                    (sel.len() > 1 && sel.contains(&rf)).then_some(sel)
+                });
                 resp.context_menu(|ui| {
+                    if let Some(keys) = bulk.clone() {
+                        ui.label(egui::RichText::new(tl!("Temporal Interpolation")).color(app.tokens.text_dim));
+                        for (label, interp) in [
+                            (tl!("Linear"), "linear"),
+                            (tl!("Bezier"), "bezier"),
+                            (tl!("Auto Bezier"), "autoBezier"),
+                            (tl!("Continuous Bezier"), "continuousBezier"),
+                            (tl!("Hold"), "hold"),
+                            (tl!("Ease In"), "easeIn"),
+                            (tl!("Ease Out"), "easeOut"),
+                        ] {
+                            let b = ui.button(label);
+                            if b.clicked() {
+                                acts.push((
+                                    "effects.setInterpolation",
+                                    json!({"keyframes": keys.iter().map(keyframe_json).collect::<Vec<_>>(), "interpolation": interp}),
+                                ));
+                                ui.close();
+                            }
+                        }
+                        ui.separator();
+                    }
                     let b = ui.button(tl!("Delete"));
                     app.auto.add(&format!("timeline.clip.{}.volume.kf.{i}.delete", it.id.0), b.rect, "Delete");
                     if b.clicked() {
-                        acts.push(("effects.deleteKeyframe", json!({"clip": it.id.0, "effect": "volume", "param": "level", "mediaTime": time.0})));
+                        if let Some(keys) = bulk {
+                            acts.push(("effects.deleteKeyframes", json!({"keyframes": keys.iter().map(keyframe_json).collect::<Vec<_>>()})));
+                        } else {
+                            acts.push(("effects.deleteKeyframe", json!({"clip": it.id.0, "effect": "volume", "param": "level", "mediaTime": time.0})));
+                        }
                         ui.close();
                     }
                 });

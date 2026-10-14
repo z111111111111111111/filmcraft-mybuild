@@ -730,6 +730,89 @@ pub(crate) fn wants_new_track(p: &Value) -> bool {
     ["track", "audioTrack"].iter().any(|k| p.get(*k).and_then(Value::as_str).is_some_and(|v| v.eq_ignore_ascii_case("new")))
 }
 
+/// A `Vn` / `An` track name as (is_video, 1-based number); `None` for anything else
+/// (ids, `"new"`, garbage). Numbers below 1 do not count.
+fn named_track_index(name: &str) -> Option<(bool, usize)> {
+    let mut rest = name.chars();
+    let video = match rest.next()? {
+        'v' | 'V' => true,
+        'a' | 'A' => false,
+        _ => return None,
+    };
+    let n: usize = rest.as_str().parse().ok()?;
+    (n >= 1).then_some((video, n))
+}
+
+/// Grow the sequence so every `Vn` / `An` name in `track`, `audioTrack` and `moves[].track`
+/// exists: naming a track past the last one adds the missing tracks instead of failing.
+/// Sequences still start at three video and three audio tracks; only an explicit higher name
+/// grows them (up to `MAX_TRACKS` of a kind). Anything else still errors in `track_p`.
+pub(crate) fn ensure_named_tracks(s: &mut Session, p: &Value, cmd: &'static str) -> Result<()> {
+    let mut (want_v, want_a) = (0usize, 0usize);
+    let mut scan = |v: &Value| {
+        if let Some(name) = v.as_str()
+            && let Some((video, n)) = named_track_index(name)
+        {
+            if video {
+                want_v = want_v.max(n);
+            } else {
+                want_a = want_a.max(n);
+            }
+        }
+    };
+    for k in ["track", "audioTrack"] {
+        if let Some(v) = p.get(k) {
+            scan(v);
+        }
+    }
+    if let Some(moves) = p.get("moves").and_then(Value::as_array) {
+        for m in moves {
+            if let Some(v) = m.get("track") {
+                scan(v);
+            }
+        }
+    }
+    if want_v == 0 && want_a == 0 {
+        return Ok(());
+    }
+    let q = s.active_sequence().ok_or(EngineError::NoSequence)?;
+    let (need_v, need_a) = (want_v.saturating_sub(q.video_tracks.len()), want_a.saturating_sub(q.audio_tracks.len()));
+    if need_v == 0 && need_a == 0 {
+        return Ok(());
+    }
+    if q.video_tracks.len() + need_v > MAX_TRACKS || q.audio_tracks.len() + need_a > MAX_TRACKS {
+        return Err(bad(cmd, format!("a sequence has at most {MAX_TRACKS} tracks of a kind")));
+    }
+    add_tracks(s, &json!({"video": need_v as u64, "audio": need_a as u64}))?;
+    Ok(())
+}
+
+/// Run `run` after [`ensure_named_tracks`], folding the track creation into the same undo
+/// step when both edits succeed (like `place_on_new_tracks`); when `run` fails, the added
+/// tracks go away again so a failed place or move leaves no empty tracks behind.
+pub(crate) fn with_ensured_tracks<R>(s: &mut Session, p: &Value, cmd: &'static str, run: impl FnOnce(&mut Session) -> Result<R>) -> Result<R> {
+    let mark = s.history.undo.len();
+    ensure_named_tracks(s, p, cmd)?;
+    let grew = s.history.undo.len() > mark;
+    match run(s) {
+        Ok(v) => {
+            if grew && s.history.undo.len() == mark + 2
+                && let (Some((label, _)), Some((_, before))) = (s.history.undo.pop(), s.history.undo.pop())
+            {
+                s.history.undo.push((label, before));
+            }
+            Ok(v)
+        }
+        Err(e) => {
+            if grew {
+                s.undo();
+                s.history.redo.pop();
+            }
+            Err(e)
+        }
+    }
+}
+
 /// `timeline.place` with `"track":"new"` and/or `"audioTrack":"new"` (#483: media dropped in the
 /// empty space above the video tracks or below the audio tracks): a track is added after the
 /// last one of its kind for each stream the item carries (and the call enables), then the clip

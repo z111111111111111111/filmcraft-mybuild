@@ -1106,6 +1106,49 @@ mod tests {
     }
 
     #[test]
+    fn arabic_words_shape_join_and_read_right_to_left() {
+        // Two Arabic words: the second logical word draws left of the first, letters join
+        // (fewer glyphs than characters is common via lam-alef/contextual forms), no tofu,
+        // and every character boundary keeps a caret stop in logical order.
+        let text = "مرحبا بالعالم";
+        let l = layout(text, &st(40.0), &ParagraphStyle::default());
+        assert!(l.glyphs.iter().all(|g| g.id != 0), "Arabic drew tofu: {:?}", l.glyphs);
+        // visual order: the first word's ink is right of the last word's ink
+        let x_of_cluster = |byte: usize| {
+            l.glyphs.iter().filter(|g| g.cluster == byte).map(|g| g.x).fold(f32::MAX, f32::min)
+        };
+        let first = x_of_cluster(0);
+        let last_space = text.rfind(' ').unwrap();
+        let last_word_start = last_space + 1;
+        let last = x_of_cluster(last_word_start);
+        assert!(first > last, "first word right of last word: {first} vs {last}");
+        // carets cover every byte boundary in logical order
+        let stops: Vec<usize> = l.lines[0].carets.iter().map(|c| c.0).collect();
+        let mut want = vec![0];
+        for (b, _) in text.char_indices().skip(1) {
+            want.push(b);
+        }
+        want.push(text.len());
+        assert_eq!(stops, want, "{stops:?}");
+        // mixed text: Latin stays left-to-right around the Arabic phrase
+        let mixed = layout("قال FilmCraft جيد", &st(40.0), &ParagraphStyle::default());
+        assert!(mixed.glyphs.iter().all(|g| g.id != 0));
+        // explicit direction overrides the first-strong-character guess
+        let ltr = layout(
+            "مرحبا",
+            &st(40.0),
+            &ParagraphStyle { rtl: Some(false), ..Default::default() },
+        );
+        let rtl = layout("مرحبا", &st(40.0), &ParagraphStyle { rtl: Some(true), ..Default::default() });
+        assert_eq!(ltr.glyphs.len(), rtl.glyphs.len(), "same shaping either way");
+        // diacritics (tashkeel) stay with their base: shaping produces ink, carets still per char
+        let vocalised_text = "كَتَبَ";
+        let vocalised = layout(vocalised_text, &st(40.0), &ParagraphStyle::default());
+        assert!(vocalised.glyphs.iter().all(|g| g.id != 0));
+        assert_eq!(vocalised.lines[0].carets.len(), vocalised_text.chars().count() + 1);
+    }
+
+    #[test]
     fn caps_and_small_caps() {
         let s = st(50.0);
         let up = measure("HELLO", &s);

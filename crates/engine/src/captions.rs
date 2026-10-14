@@ -10,7 +10,7 @@ use serde_json::{Value, json};
 use filmcraft_captions::{Document, Format, WriteOptions};
 use filmcraft_edit as edit;
 use filmcraft_edit::Edge;
-use filmcraft_project::{CaptionAlign, CaptionAnchor, CaptionFormat, CaptionStyle, CaptionTrack, ClipId, SequenceSettings, TrackId};
+use filmcraft_project::{CaptionAlign, CaptionAnchor, CaptionDir, CaptionFormat, CaptionStyle, CaptionTrack, ClipId, SequenceSettings, TrackId};
 use filmcraft_time::{Tick, TimeDisplay, format_time};
 
 use crate::commands::{CommandSpec, always, bad, bool_p, f64_p, has_seq, str_p, time_p, u64_p};
@@ -296,7 +296,7 @@ pub fn commands() -> Vec<CommandSpec> {
             "Caption Track Style",
             &[],
             None,
-            r##"{"track":id|"C1","font":str?,"size":f32?,"color":"#rrggbb[aa]"?,"background":bool?,"backgroundColor":"#rrggbbaa"?,"align":"left|center|right"?,"anchor":"top|middle|bottom"?,"margin":0..0.45 (fraction of frame height)?,"lineSpacing":f32?,"outline":f32?,"outlineColor":str?,"reset":bool?}"##,
+            r##"{"track":id|"C1","font":str?,"size":f32?,"color":"#rrggbb[aa]"?,"background":bool?,"backgroundColor":"#rrggbbaa"?,"align":"left|center|right"?,"anchor":"top|middle|bottom"?,"dir":"auto|ltr|rtl"? (paragraph direction; auto follows the first strong character),"margin":0..0.45 (fraction of frame height)?,"lineSpacing":f32?,"outline":f32?,"outlineColor":str?,"reset":bool?}"##,
             has_caption_track,
             |s, p| {
                 let tid = track_param(s, p).ok_or_else(|| bad("captions.setStyle", "no such caption track"))?;
@@ -348,6 +348,10 @@ pub fn commands() -> Vec<CommandSpec> {
                         Some("bottom") => y.anchor = CaptionAnchor::Bottom,
                         Some(o) => return Err(bad("captions.setStyle", format!("unknown anchor `{o}`"))),
                         None => {}
+                    }
+                    if let Some(d) = str_p(&p, "dir").or_else(|| str_p(&p, "direction")) {
+                        y.dir = CaptionDir::from_name(d)
+                            .ok_or_else(|| bad("captions.setStyle", format!("unknown dir `{d}` (want auto|ltr|rtl)")))?;
                     }
                     Ok(())
                 })?;

@@ -10,7 +10,7 @@ use filmcraft_color::srgb_to_linear;
 use filmcraft_project::{Caption, CaptionAlign, CaptionAnchor, CaptionStyle, CaptionTrack, Sequence};
 use filmcraft_time::Tick;
 
-use filmcraft_text::{ParagraphStyle, TextStyle, layout, render};
+use filmcraft_text::{Align, ParagraphStyle, TextStyle, layout, render};
 
 /// A rendered caption: premultiplied linear-light RGBA f32 pixels at `(x, y)` in the frame.
 #[derive(Clone, Debug, PartialEq)]
@@ -128,7 +128,22 @@ pub fn render_caption(c: &Caption, style: &CaptionStyle, w: usize, h: usize) -> 
     let pad_x = (px * 0.3).round();
     let block_h = lh * lines.len() as f32;
     let (line_override, align_override) = vtt_overrides(&c.settings);
-    let align = align_override.unwrap_or(style.align);
+    // WebVTT `align:start/end` follows the paragraph direction: in RTL, start is right.
+    // An explicit `align:left/right/center` in the settings is absolute and never flipped.
+    let mut align = align_override.unwrap_or(style.align);
+    if c.settings.contains("align:start") || c.settings.contains("align:end") {
+        let rtl = match style.dir.as_rtl() {
+            Some(b) => b,
+            None => lines.iter().any(has_rtl),
+        };
+        if rtl {
+            align = match align {
+                CaptionAlign::Left => CaptionAlign::Right,
+                CaptionAlign::Right => CaptionAlign::Left,
+                other => other,
+            };
+        }
+    }
     let margin = style.margin.clamp(0.0, 0.45) * h as f32;
     let top = match (line_override, style.anchor) {
         (Some(f), _) => (f * h as f32).min(h as f32 - block_h),
@@ -174,7 +189,16 @@ pub fn render_caption(c: &Caption, style: &CaptionStyle, w: usize, h: usize) -> 
             }
         }
         let baseline = lt + (lh - (asc + desc)) / 2.0 + asc;
-        let l = layout(line, &ts, &ParagraphStyle::default());
+        let para = ParagraphStyle {
+            align: match align {
+                CaptionAlign::Left => Align::Left,
+                CaptionAlign::Right => Align::Right,
+                CaptionAlign::Center => Align::Center,
+            },
+            rtl: style.dir.as_rtl(),
+            ..Default::default()
+        };
+        let l = layout(line, &ts, &para);
         let mut m = filmcraft_text::Mask { w: ow, h: oh, a: std::mem::take(&mut cover) };
         render::draw(&l, &render::at(xs[i], baseline.round()), &mut m, (ox, oy));
         cover = m.a;
@@ -199,6 +223,14 @@ pub fn render_caption(c: &Caption, style: &CaptionStyle, w: usize, h: usize) -> 
         out[j * 4..j * 4 + 4].copy_from_slice(&p);
     }
     Some(Overlay { x: ox, y: oy, w: ow, h: oh, px: out })
+}
+
+/// Whether `s` contains an Arabic/Hebrew letter (a rough RTL hint without a bidi table).
+fn has_rtl(s: &str) -> bool {
+    s.chars().any(|c| {
+        matches!(c as u32,
+            0x0590..=0x08FF | 0xFB1D..=0xFDFF | 0xFE70..=0xFEFF | 0x10E60..=0x10E7F | 0x1EE00..=0x1EEFF)
+    })
 }
 
 /// Max-filter a coverage mask with a disc of radius `r`.

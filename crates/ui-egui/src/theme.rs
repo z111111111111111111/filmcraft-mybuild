@@ -414,19 +414,38 @@ pub fn font_families() -> Vec<FontFamily> {
     vec![FontFamily::Proportional, FontFamily::Monospace, FontFamily::Name("semibold".into()), FontFamily::Name("medium".into())]
 }
 
-/// Install the Latin UI fonts, Chinese fallback (craft-fonts or an installed face), Japanese
-/// craft-fonts, Arabic and Hebrew fallbacks (craft-fonts or installed faces, [`crate::rtl`]) and
-/// egui visuals. Document names keep their glyphs in every interface language.
+/// Install the Latin UI fonts, bundled Arabic fallback (Noto Sans Arabic), Chinese fallback
+/// (craft-fonts or an installed face), Japanese craft-fonts, Arabic and Hebrew fallbacks
+/// (craft-fonts or installed faces, [`crate::rtl`]) and egui visuals. Document names keep
+/// their glyphs in every interface language.
 pub fn install(ctx: &egui::Context, t: &Tokens) {
     let mut fonts = FontDefinitions::default();
     fonts.font_data.insert("inter".into(), Arc::new(FontData::from_static(filmcraft_text::fonts::INTER_REGULAR)));
     fonts.font_data.insert("inter-medium".into(), Arc::new(FontData::from_static(filmcraft_text::fonts::INTER_MEDIUM)));
     fonts.font_data.insert("inter-semibold".into(), Arc::new(FontData::from_static(filmcraft_text::fonts::INTER_SEMIBOLD)));
     fonts.font_data.insert("jbmono".into(), Arc::new(FontData::from_static(filmcraft_text::fonts::JETBRAINS_MONO_REGULAR)));
+    fonts.font_data.insert(
+        "noto-arabic".into(),
+        Arc::new(FontData::from_static(filmcraft_text::fonts::NOTO_SANS_ARABIC_REGULAR)),
+    );
+    fonts.font_data.insert(
+        "noto-arabic-bold".into(),
+        Arc::new(FontData::from_static(filmcraft_text::fonts::NOTO_SANS_ARABIC_BOLD)),
+    );
     fonts.families.entry(FontFamily::Proportional).or_default().insert(0, "inter".into());
     fonts.families.entry(FontFamily::Monospace).or_default().insert(0, "jbmono".into());
     fonts.families.insert(FontFamily::Name("semibold".into()), vec!["inter-semibold".into(), "inter".into()]);
     fonts.families.insert(FontFamily::Name("medium".into()), vec!["inter-medium".into(), "inter".into()]);
+    // Bundled Arabic directly after the Latin faces so every family shapes Arabic without
+    // waiting for a system scan; craft/system faces registered by `rtl::install` stay after it.
+    for stack in fonts.families.values_mut() {
+        if !stack.contains(&"noto-arabic".to_string()) {
+            stack.push("noto-arabic".into());
+        }
+        if !stack.contains(&"noto-arabic-bold".to_string()) {
+            stack.push("noto-arabic-bold".into());
+        }
+    }
     // Japanese before Chinese: the two share code points, and Japanese text must keep Japanese
     // glyph forms; Chinese faces still cover the hanzi Japanese fonts lack
     add_craft_fonts(&mut fonts);

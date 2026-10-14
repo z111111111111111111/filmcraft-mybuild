@@ -399,3 +399,152 @@ fn path_json_round_trip_keeps_tangents() {
     // the serialized project form still parses
     assert_eq!(crate::masks::path_from_json(&serde_json::to_value(&path).unwrap()), Some(path));
 }
+
+// ---------------------------------------------------------------- object select
+
+/// A 320×240 clip split into a solid red left half and a solid blue right half: object
+/// selection from any seed is exactly one half, so outlines are assertable pixel by pixel.
+struct Flat {
+    info: filmcraft_media::MediaInfo,
+}
+
+impl filmcraft_media::MediaSource for Flat {
+    fn info(&self) -> &filmcraft_media::MediaInfo {
+        &self.info
+    }
+    fn video_frame(&self, _req: filmcraft_media::FrameRequest) -> filmcraft_media::Result<std::sync::Arc<filmcraft_frame::VideoFrame>> {
+        let (w, h) = (320usize, 240usize);
+        let mut px = vec![0u8; w * h * 4];
+        for y in 0..h {
+            for x in 0..w {
+                let c = if x < w / 2 { [200u8, 40, 40] } else { [40, 40, 200] };
+                if let Some(slot) = px.get_mut(y * w * 4 + x * 4..y * w * 4 + x * 4 + 4) {
+                    slot.copy_from_slice(&[c[0], c[1], c[2], 255]);
+                }
+            }
+        }
+        Ok(std::sync::Arc::new(filmcraft_frame::VideoFrame::rgba8(w as u32, h as u32, px)))
+    }
+    fn audio(&self, _start: i64, frames: usize, sample_rate: u32) -> filmcraft_media::Result<filmcraft_frame::AudioBuffer> {
+        Ok(filmcraft_frame::AudioBuffer::silence(sample_rate, 2, frames))
+    }
+}
+
+fn flat_session() -> (Session, ClipId) {
+    let rate = filmcraft_time::FrameRate::FPS_24;
+    let g = filmcraft_media::generators::GeneratorSource::new(
+        filmcraft_media::Generator::ColorMatte { color: [0.5, 0.5, 0.5, 1.0] },
+        320,
+        240,
+        rate,
+        rate.tick_of(48),
+    );
+    let info = g.info().clone();
+    let mut p = filmcraft_project::Project::new("select");
+    let item = p.add_item(
+        "flat",
+        filmcraft_project::Label::Iris,
+        filmcraft_project::ItemKind::Media(filmcraft_project::MediaClip {
+            media: filmcraft_project::MediaRef::Generator(g.generator.clone()),
+            info: info.clone(),
+            interpret: Default::default(),
+            mark_in: None,
+            mark_out: None,
+            markers: vec![],
+            offline: false,
+            proxy: None,
+            identity: None,
+        }),
+        None,
+    );
+    let seq = p.new_sequence("s", filmcraft_project::SequenceSettings { width: 320, height: 240, frame_rate: rate, ..Default::default() }, 1, 0, None);
+    let ti = p
+        .make_track_item(item, filmcraft_project::TrackKind::Video, Tick::ZERO, filmcraft_time::TimeRange::new(Tick::ZERO, rate.tick_of(48)), rate)
+        .unwrap();
+    let clip = ti.id;
+    p.sequence_mut(seq).unwrap().video_tracks[0].items.push(ti);
+    let mut s = Session { project: std::sync::Arc::new(p), ..Default::default() };
+    s.state.active_sequence = Some(seq);
+    s.state.selection = vec![clip];
+    s.media.insert(item, std::sync::Arc::new(Flat { info }));
+    (s, clip)
+}
+
+fn path_bbox(s: &Session) -> (f64, f64, f64, f64) {
+    let l = s.execute("masks.list", json!({})).unwrap();
+    let vs = l["masks"][0]["path"]["vertices"].as_array().unwrap();
+    let mut b = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
+    for v in vs {
+        let (x, y) = (v["p"][0].as_f64().unwrap(), v["p"][1].as_f64().unwrap());
+        b = (b.0.min(x), b.1.min(y), b.2.max(x), b.3.max(y));
+    }
+    b
+}
+
+#[test]
+fn select_object_masks_the_seeded_half() {
+    let (mut s, clip) = flat_session();
+    let r = s.execute("masks.selectObject", json!({"clip": clip.0, "point": [80, 120]})).unwrap();
+    assert_eq!(r["mask"], 0);
+    assert_eq!(r["name"], "Object (1)");
+    assert!(r["track"].is_null());
+    let n = r["vertices"].as_u64().unwrap();
+    assert!(n >= 3 && n <= 512, "{n}");
+    assert!(s.state.selected_mask.is_some(), "the new mask is selected");
+    let b = path_bbox(&s);
+    assert!((b.0 - 0.0).abs() <= 3.0 && (b.1 - 0.0).abs() <= 3.0, "{b:?}");
+    assert!((b.2 - 160.0).abs() <= 3.0 && (b.3 - 240.0).abs() <= 3.0, "{b:?}");
+    // a box seeds from its centre: the right half this time
+    let r = s.execute("masks.selectObject", json!({"clip": clip.0, "box": [160, 0, 160, 240], "feather": 1.5})).unwrap();
+    assert_eq!(r["name"], "Object (2)");
+    let b = path_bbox(&s);
+    assert!((b.0 - 160.0).abs() <= 3.0 && (b.2 - 320.0).abs() <= 3.0, "{b:?}");
+    // one undo step per selection
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(s.execute("masks.list", json!({})) .unwrap()["masks"].as_array().unwrap().len(), 1);
+    s.execute("edit.undo", json!({})).unwrap();
+    assert!(s.execute("masks.list", json!({})).unwrap()["masks"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn select_human_is_the_person_preset_and_can_track() {
+    let (mut s, clip) = flat_session();
+    let r = s.execute("masks.selectHuman", json!({"clip": clip.0, "box": [0, 0, 160, 240], "track": "none"})).unwrap();
+    assert_eq!(r["name"], "Human (1)");
+    assert!(r["track"].is_null());
+    let b = path_bbox(&s);
+    assert!((b.2 - 160.0).abs() <= 3.0, "{b:?}");
+    // tracking starts as a background job from the same call
+    let r = s.execute("masks.selectHuman", json!({"clip": clip.0, "point": [240, 120]})).unwrap();
+    let job = r["track"]["job"].as_u64().expect("a track job started: {r}");
+    s.execute("jobs.cancel", json!({"job": job})).unwrap();
+    let t0 = std::time::Instant::now();
+    while !s.mask_jobs.is_empty() && t0.elapsed().as_secs() < 60 {
+        s.poll_persistence();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(s.mask_jobs.is_empty());
+}
+
+#[test]
+fn select_refuses_hostile_params_without_changing_anything() {
+    let (mut s, clip) = flat_session();
+    let before = s.project.clone();
+    let undo = s.history.undo.len();
+    for params in [
+        json!({"clip": clip.0}),
+        json!({"clip": clip.0, "point": [10, 10], "box": [0, 0, 10, 10]}),
+        json!({"clip": clip.0, "point": [9999, 9999]}),
+        json!({"clip": clip.0, "point": [-5, 10]}),
+        json!({"clip": clip.0, "box": [0, 0, 0, 10]}),
+        json!({"clip": clip.0, "point": [10, 10], "tolerance": 101.0}),
+        json!({"clip": clip.0, "point": [10, 10], "feather": -1.0}),
+        json!({"clip": clip.0, "point": [10, 10], "track": "sideways"}),
+    ] {
+        assert!(s.execute("masks.selectObject", params).is_err());
+    }
+    assert!(s.execute("masks.selectHuman", json!({"clip": clip.0, "point": [10, 10], "track": "sideways"})).is_err());
+    assert!(std::sync::Arc::ptr_eq(&before, &s.project));
+    assert_eq!(s.history.undo.len(), undo);
+    assert!(s.execute("masks.list", json!({})).unwrap()["masks"].as_array().unwrap().is_empty());
+}

@@ -22,6 +22,8 @@ pub enum Tool {
     Pen,
     Rectangle,
     Ellipse,
+    ObjectSelect,
+    HumanSelect,
     Hand,
     Zoom,
     Type,
@@ -29,7 +31,7 @@ pub enum Tool {
 }
 
 impl Tool {
-    pub const ALL: [Tool; 17] = [
+    pub const ALL: [Tool; 19] = [
         Tool::Selection,
         Tool::TrackSelectForward,
         Tool::TrackSelectBackward,
@@ -43,6 +45,8 @@ impl Tool {
         Tool::Pen,
         Tool::Rectangle,
         Tool::Ellipse,
+        Tool::ObjectSelect,
+        Tool::HumanSelect,
         Tool::Hand,
         Tool::Zoom,
         Tool::Type,
@@ -63,6 +67,8 @@ impl Tool {
             Tool::Pen => "Pen Tool",
             Tool::Rectangle => "Rectangle Tool",
             Tool::Ellipse => "Ellipse Tool",
+            Tool::ObjectSelect => "Object Select Tool",
+            Tool::HumanSelect => "Human Select Tool",
             Tool::Hand => "Hand Tool",
             Tool::Zoom => "Zoom Tool",
             Tool::Type => "Type Tool",
@@ -82,7 +88,7 @@ impl Tool {
             Tool::Slip => "Y",
             Tool::Slide => "U",
             Tool::Pen => "P",
-            Tool::Rectangle | Tool::Ellipse => "",
+            Tool::Rectangle | Tool::Ellipse | Tool::ObjectSelect | Tool::HumanSelect => "",
             Tool::Hand => "H",
             Tool::Zoom => "Z",
             Tool::Type => "T",
@@ -104,6 +110,8 @@ impl Tool {
             Tool::Pen => Icon::Pen,
             Tool::Rectangle => Icon::Rectangle,
             Tool::Ellipse => Icon::Ellipse,
+            Tool::ObjectSelect => Icon::ObjectSelect,
+            Tool::HumanSelect => Icon::HumanSelect,
             Tool::Hand => Icon::Hand,
             Tool::Zoom => Icon::Zoom,
             Tool::Type | Tool::VerticalType => Icon::Type,
@@ -125,6 +133,7 @@ impl Tool {
             vec![Tool::Razor],
             vec![Tool::Slip, Tool::Slide],
             vec![Tool::Pen, Tool::Rectangle, Tool::Ellipse],
+            vec![Tool::ObjectSelect, Tool::HumanSelect],
             vec![Tool::Hand, Tool::Zoom],
             vec![Tool::Type, Tool::VerticalType],
         ]
@@ -413,9 +422,10 @@ pub struct Eyedropper {
     pub mask: Option<usize>,
 }
 
-/// A keyframe selected in the Effect Controls keyframe lane: clip, effect index, parameter (of an
-/// effect mask when `mask` is set) and the keyframe's media time. The panel drops references that
-/// no longer match a keyframe (deleted, moved, another clip selected).
+/// A keyframe selected in the Effect Controls keyframe lane or on the timeline's Volume line:
+/// clip, effect index, parameter (of an effect mask when `mask` is set) and the keyframe's
+/// media time. The panels drop references that no longer match a keyframe (deleted, moved,
+/// another clip selected).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KeyframeRef {
     pub clip: u64,
@@ -472,7 +482,9 @@ pub struct UiState {
     /// monitor (Esc or a click elsewhere disarms it). Never saved.
     #[serde(skip)]
     pub eyedropper: Option<Eyedropper>,
-    /// Effect Controls: the selected keyframes, highlighted in the keyframe lane (a click selects one).
+    /// The selected keyframes, shared by Effect Controls and the timeline's Volume line:
+    /// highlighted in the keyframe lane and on the clips (a click selects one, Shift toggles,
+    /// the timeline marquee unions the boxed ones).
     #[serde(default)]
     pub keyframe_selection: Vec<KeyframeRef>,
     /// Essential Sound sub-tab: "Edit" or "Browse".

@@ -508,7 +508,7 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
             let body = Rect::from_min_max(pos2(x0, r.rect.min.y + 1.0), pos2(x1.max(x0 + 1.0), r.rect.max.y - 1.0));
             draw_clip(app, &ctx, &p, body, it, r.kind, selection.contains(&it.id), &t, rate);
             if volume_line {
-                super::timeline_volume::paint(&p, body, it);
+                super::timeline_volume::paint(&p, body, it, &app.ui.keyframe_selection);
             }
             app.auto.add(&format!("timeline.clip.{}", it.id.0), body.intersect(content), &it.name);
             // a nest that runs past the end of its sequence's contents: that part is empty
@@ -532,7 +532,7 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
                 let body = Rect::from_min_max(pos2(layout.x_of(*start), r.rect.min.y + 1.0), pos2(layout.x_of(*start + *dur), r.rect.max.y - 1.0));
                 draw_clip(app, &ctx, &p, body, it, r.kind, true, &t, rate);
                 if volume_line {
-                    super::timeline_volume::paint(&p, body, it);
+                    super::timeline_volume::paint(&p, body, it, &app.ui.keyframe_selection);
                 }
             }
         }
@@ -1849,6 +1849,13 @@ fn marquee_clips(seq: &Sequence, layout: &Layout, r: Rect) -> Vec<ClipId> {
         .collect()
 }
 
+/// (kind, index) of `tid` among the sequence's video / audio tracks.
+fn track_index(seq: &Sequence, tid: TrackId) -> Option<(TrackKind, usize)> {
+    seq.video_tracks.iter().position(|t| t.id == tid).map(|i| (TrackKind::Video, i)).or_else(|| {
+        seq.audio_tracks.iter().position(|t| t.id == tid).map(|i| (TrackKind::Audio, i))
+    })
+}
+
 fn shift_track(seq: &Sequence, tid: TrackId, delta: i32) -> Option<TrackId> {
     if delta == 0 {
         return Some(tid);
@@ -1860,6 +1867,25 @@ fn shift_track(seq: &Sequence, tid: TrackId, delta: i32) -> Option<TrackId> {
         }
     }
     Some(tid)
+}
+
+/// Where `tid` lands after a vertical drag of `delta` tracks: the track id, or a `Vn` / `An`
+/// name past the last track (the engine adds the missing tracks) so dragging a clip above V3
+/// grows the timeline instead of sticking to the top track. Below V1 / A1 still clamps.
+fn shift_track_or_name(seq: &Sequence, tid: TrackId, delta: i32) -> serde_json::Value {
+    for (tracks, letter) in [(&seq.video_tracks, 'V'), (&seq.audio_tracks, 'A')] {
+        if let Some(i) = tracks.iter().position(|t| t.id == tid) {
+            let want = i as i32 + delta;
+            if want < 0 {
+                return serde_json::json!(tracks.first().map(|t| t.id.0).unwrap_or(tid.0));
+            }
+            if (want as usize) < tracks.len() {
+                return serde_json::json!(tracks[want as usize].id.0);
+            }
+            return serde_json::json!(format!("{letter}{}", want + 1));
+        }
+    }
+    serde_json::json!(tid.0)
 }
 
 /// The clip context menu: groups (separated by rules) of (label, command id). Entries marked `…`
@@ -2360,9 +2386,13 @@ fn interact(app: &mut FilmcraftApp, ui: &mut egui::Ui, seq: &Sequence, layout: &
             // the video and audio tracks, #683)
             (_, Grab::Other(hit @ (Hit::Empty { .. } | Hit::None))) if layout.content.contains(p) => {
                 if resp.drag_started() {
+                    // the marquee unions boxed Volume keyframes into the shared keyframe selection;
+                    // stashed here so Escape puts back the selection the drag began with
+                    ui.data_mut(|d| d.insert_temp(egui::Id::new("tl-marquee-keys"), app.ui.keyframe_selection.clone()));
                     Some(Drag::Marquee { start: p, before: app.session.state.selection.clone(), add: mods.shift || mods.command })
                 } else {
                     app.session.state.selection.clear();
+                    app.ui.keyframe_selection.clear();
                     app.session.state.edit_points.clear();
                     app.session.state.transition_selection.clear();
                     // empty time between clips: select the gap, for Delete to close it (#648, #668)
@@ -2409,6 +2439,10 @@ fn interact(app: &mut FilmcraftApp, ui: &mut egui::Ui, seq: &Sequence, layout: &
                 // the live box (#1028) already changed the selection: put back the one the drag began with
                 Drag::Marquee { before, .. } => {
                     app.session.state.selection = before;
+                    if let Some(keys) = ctx.data(|d| d.get_temp::<Vec<crate::state::KeyframeRef>>(egui::Id::new("tl-marquee-keys"))) {
+                        app.ui.keyframe_selection = keys;
+                    }
+                    ctx.data_mut(|d| d.remove::<Vec<crate::state::KeyframeRef>>(egui::Id::new("tl-marquee-keys")));
                 }
                 _ => {}
             }
@@ -2456,8 +2490,9 @@ fn interact(app: &mut FilmcraftApp, ui: &mut egui::Ui, seq: &Sequence, layout: &
                     (Some(c), Some(s)) if c.kind == s.kind => c.index as i32 - s.index as i32,
                     _ => 0,
                 };
-                // #1104: past the last track of the clips' kind, a new track (only for clips of one track)
-                let new_track = start_row.filter(|_| clips.iter().all(|c| seq.find_item(*c).is_some_and(|(t, _)| t == start_track))).and_then(|s| {
+                // past the empty band of the dragged clips' kind, new tracks: any kind may grow
+                // (a linked pair dragged up grows video while its audio shifts as usual)
+                let new_track = start_row.and_then(|s| {
                     let (vh, ah) = (app.ui.timeline.video_track_h, app.ui.timeline.audio_track_h);
                     new_track_at(seq, layout, p.y, vh, ah).filter(|(kind, _)| *kind == s.kind)
                 });
@@ -2519,6 +2554,13 @@ fn interact(app: &mut FilmcraftApp, ui: &mut egui::Ui, seq: &Sequence, layout: &
                     }
                 }
                 app.session.state.selection = sel;
+                // Volume keyframes in the box join the shared keyframe selection, like dragging
+                // the box in Effect Controls does
+                for k in super::timeline_volume::keys_in(seq, layout, r) {
+                    if !app.ui.keyframe_selection.contains(&k) {
+                        app.ui.keyframe_selection.push(k);
+                    }
+                }
                 Some(Drag::Marquee { start, before, add })
             }
             other => Some(other),
@@ -2544,8 +2586,29 @@ fn interact(app: &mut FilmcraftApp, ui: &mut egui::Ui, seq: &Sequence, layout: &
         if !cancelled && let Some(d) = app.tl.drag.take() {
             let r = match d {
                 Drag::Move { clips, offset, track_delta, new_track, copy, .. } if offset != Tick::ZERO || track_delta != 0 || new_track.is_some() => {
-                    // #1104: dropped past the last track, the clips go onto a new one
-                    let to = |tid| new_track.map_or_else(|| json!(shift_track(seq, tid, track_delta).unwrap_or(tid).0), |_| json!("new"));
+                    // dropped in the empty band past the last track of a kind, the topmost dragged
+                    // clip of that kind takes the next track and the rest keep their spacing (`Vn` /
+                    // `An` names; the engine adds every missing track, so a stack dragged above V3
+                    // lands on V4 and up intact). Other kinds shift by rows as usual.
+                    let grow = new_track.map(|(kind, _)| kind);
+                    let to = |tid: TrackId| -> Value {
+                        match (grow, track_index(seq, tid)) {
+                            (Some(g), Some((kind, i))) if kind == g => {
+                                let len = if kind == TrackKind::Video { seq.video_tracks.len() } else { seq.audio_tracks.len() } as i32;
+                                let top = clips
+                                    .iter()
+                                    .filter_map(|c| seq.find_item(*c))
+                                    .filter_map(|(t, _)| track_index(seq, t))
+                                    .filter(|(k, _)| *k == g)
+                                    .map(|(_, j)| j as i32)
+                                    .max()
+                                    .unwrap_or(i as i32);
+                                let letter = if kind == TrackKind::Video { 'V' } else { 'A' };
+                                json!(format!("{letter}{}", len + (i as i32 - top) + 1))
+                            }
+                            _ => shift_track_or_name(seq, tid, track_delta),
+                        }
+                    };
                     let moves: Vec<Value> = clips
                         .iter()
                         .filter_map(|c| seq.find_item(*c).map(|(tid, it)| json!({"clip": c.0, "track": to(tid), "time": (it.start + offset).max(Tick::ZERO).0})))
@@ -2574,9 +2637,19 @@ fn interact(app: &mut FilmcraftApp, ui: &mut egui::Ui, seq: &Sequence, layout: &
                     // egui ends a drag on Escape: that cancels the box, as in the Project panel
                     match resp.interact_pointer_pos() {
                         Some(end) if !ctx.input(|i| i.key_pressed(egui::Key::Escape)) => {
-                            let ids: Vec<u64> = marquee_clips(seq, layout, Rect::from_two_pos(start, end)).iter().map(|c| c.0).collect();
-                            Some(app.session.execute("timeline.select", json!({"clips": ids, "add": add})))
-                        }
+                            let r = Rect::from_two_pos(start, end);
+                            let ids: Vec<u64> = marquee_clips(seq, layout, r).iter().map(|c| c.0).collect();
+                            if add {
+                                for k in super::timeline_volume::keys_in(seq, layout, r) {
+                                    if !app.ui.keyframe_selection.contains(&k) {
+                                        app.ui.keyframe_selection.push(k);
+                                    }
+                                }
+                            } else {
+                                app.ui.keyframe_selection = super::timeline_volume::keys_in(seq, layout, r);
+                            }
+                            ui.data_mut(|d| d.remove::<Vec<crate::state::KeyframeRef>>(egui::Id::new("tl-marquee-keys")));
+                            Some(app.session.execute("timeline.select", json!({"clips": ids, "add": add})))                        }
                         _ => None,
                     }
                 }
