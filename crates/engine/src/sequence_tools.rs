@@ -783,28 +783,51 @@ pub(crate) fn ensure_named_tracks(s: &mut Session, p: &Value, cmd: &'static str)
     if q.video_tracks.len() + need_v > MAX_TRACKS || q.audio_tracks.len() + need_a > MAX_TRACKS {
         return Err(bad(cmd, format!("a sequence has at most {MAX_TRACKS} tracks of a kind")));
     }
-    add_tracks(s, &json!({"video": need_v as u64, "audio": need_a as u64}))?;
+    // `add_tracks` takes at most 99 of a kind per call: grow in chunks, still one undo step
+    // per chunk (a jump to V500 costs a few steps, all redoable together)
+    let (mut need_v, mut need_a) = (need_v, need_a);
+    while need_v > 0 || need_a > 0 {
+        let (v, a) = (need_v.min(99) as u64, need_a.min(99) as u64);
+        add_tracks(s, &json!({"video": v, "audio": a}))?;
+        need_v = need_v.saturating_sub(99);
+        need_a = need_a.saturating_sub(99);
+    }
     Ok(())
 }
 
 /// Run `run` after [`ensure_named_tracks`], folding the track creation into the same undo
-/// step when both edits succeed (like `place_on_new_tracks`); when `run` fails, the added
-/// tracks go away again so a failed place or move leaves no empty tracks behind.
+/// step when the call succeeds (like `place_on_new_tracks`); when `run` fails, every added
+/// track goes away again so a failed place or move leaves no empty tracks behind.
 pub(crate) fn with_ensured_tracks<R>(s: &mut Session, p: &Value, cmd: &'static str, run: impl FnOnce(&mut Session) -> Result<R>) -> Result<R> {
     let mark = s.history.undo.len();
     ensure_named_tracks(s, p, cmd)?;
-    let grew = s.history.undo.len() > mark;
+    let grown = s.history.undo.len() - mark;
     match run(s) {
         Ok(v) => {
-            if grew && s.history.undo.len() == mark + 2
-                && let (Some((label, _)), Some((_, before))) = (s.history.undo.pop(), s.history.undo.pop())
-            {
-                s.history.undo.push((label, before));
+            // fold the growth step(s) and the run step into one undo step: the run's label
+            // over the project of before the growth
+            if grown > 0 {
+                let mut entries = Vec::new();
+                while s.history.undo.len() > mark {
+                    match s.history.undo.pop() {
+                        Some(e) => entries.push(e),
+                        None => break,
+                    }
+                }
+                if entries.len() == grown + 1 {
+                    if let (Some((label, _)), Some((_, before))) = (entries.first(), entries.last()) {
+                        s.history.undo.push((label.clone(), before.clone()));
+                    }
+                } else {
+                    for e in entries.into_iter().rev() {
+                        s.history.undo.push(e);
+                    }
+                }
             }
             Ok(v)
         }
         Err(e) => {
-            if grew {
+            while s.history.undo.len() > mark {
                 s.undo();
                 s.history.redo.pop();
             }

@@ -717,3 +717,14 @@ fn naming_a_higher_track_adds_the_missing_tracks() {
     assert_eq!(*s.active_sequence().unwrap(), before);
     assert_eq!(s.history.undo.len(), undo);
 }
+
+#[test]
+fn naming_a_far_track_grows_in_chunks_but_undoes_as_one() {
+    let (mut s, item) = fresh();
+    let undo = s.history.undo.len();
+    place(&mut s, item, "V200", 0, 0, 10);
+    assert_eq!(s.active_sequence().unwrap().video_tracks.len(), 200);
+    assert_eq!(s.history.undo.len(), undo + 1, "one undo step however many chunks");
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(s.active_sequence().unwrap().video_tracks.len(), 3);
+}
