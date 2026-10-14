@@ -252,6 +252,10 @@ pub struct GraphicsPrefs {
     pub caption_font: String,
     pub caption_monospace_only: bool,
     pub cea708_wide: bool,
+    /// Starred font families, shared by every font picker (newest first).
+    pub font_favorites: Vec<String>,
+    /// Recently picked font families, shared by every font picker (newest first, capped).
+    pub font_recent: Vec<String>,
 }
 
 impl Default for GraphicsPrefs {
@@ -274,6 +278,8 @@ impl Default for GraphicsPrefs {
             caption_font: "JetBrains Mono".into(),
             caption_monospace_only: true,
             cea708_wide: false,
+            font_favorites: Vec::new(),
+            font_recent: Vec::new(),
         }
     }
 }

@@ -673,23 +673,12 @@ pub(crate) fn param_row(
             crate::panels::masks::path_value(app, &mut vui, clip, idx, mask, actions);
         }
         (ParamKind::Text, ParamValue::Text(s)) if pd.id == "font" && mask.is_none() => {
-            // a font picker, not a name field: the installed families, like Properties shows
-            if !filmcraft_text::fonts::system_scanned() {
-                filmcraft_text::fonts::scan_system();
+            // a font picker, not a name field: search, favorites, recents, every family
+            let (picked, r) = crate::panels::font_picker::show(app, &mut vui, &format!("ec-font-{}-{idx}", clip.0), s, vui.available_width().min(170.0), &format!("effectControls.text.{idx}.{}", pd.id));
+            app.auto.add(&format!("effectControls.text.{idx}.{}", pd.id), r.rect, pd.label);
+            if let Some(f) = picked {
+                set = Some(json!(f));
             }
-            let fams = filmcraft_text::families();
-            let r = egui::ComboBox::from_id_salt(id)
-                .selected_text(s.as_str())
-                .width(vui.available_width().min(170.0))
-                .height(400.0)
-                .show_ui(&mut vui, |ui| {
-                    for (f, _) in &fams {
-                        if ui.selectable_label(*f == *s, f).clicked() {
-                            set = Some(json!(f));
-                        }
-                    }
-                });
-            app.auto.add(&format!("effectControls.text.{idx}.{}", pd.id), r.response.rect, pd.label);
         }
         (ParamKind::Text, ParamValue::Text(s)) if pd.id == "font_style" && mask.is_none() => {
             // the styles of the layer's family (plus synthetic ones), like Properties shows

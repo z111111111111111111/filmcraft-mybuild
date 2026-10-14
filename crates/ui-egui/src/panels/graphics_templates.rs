@@ -333,7 +333,7 @@ fn row_label(ui: &mut egui::Ui, label: &str, t: &Tokens) -> egui::Ui {
 /// The template's editable properties (Essential Graphics ▸ Edit for a graphic made from a
 /// template). Returns false when the graphic has no template.
 pub fn template_controls(
-    app: &FilmcraftApp,
+    app: &mut FilmcraftApp,
     ui: &mut egui::Ui,
     clip: ClipId,
     it: &TrackItem,
@@ -426,17 +426,11 @@ pub fn template_controls(
                     Some(ParamValue::Text(s)) => s,
                     _ => String::new(),
                 };
-                let r = egui::ComboBox::from_id_salt(("gfx-tpl-font", clip.0, c.id.as_str())).selected_text(&fam).width(170.0).height(360.0).show_ui(
-                    &mut vui,
-                    |ui| {
-                        for (f, _) in filmcraft_text::families() {
-                            if ui.selectable_label(f == fam, &f).clicked() {
-                                set(json!(f), actions);
-                            }
-                        }
-                    },
-                );
-                autos.push((id, r.response.rect, c.name.clone()));
+                let (picked, r) = crate::panels::font_picker::show(app, &mut vui, &format!("gfx-tpl-font-{}-{}", clip.0, c.id.as_str()), &fam, 170.0, &id);
+                autos.push((id, r.rect, c.name.clone()));
+                if let Some(f) = picked {
+                    set(json!(f), actions);
+                }
             }
             ControlKind::Position => {
                 let v = pv.and_then(|v| v.as_vec2()).unwrap_or_default();

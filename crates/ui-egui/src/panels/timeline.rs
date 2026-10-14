@@ -2490,11 +2490,21 @@ fn interact(app: &mut FilmcraftApp, ui: &mut egui::Ui, seq: &Sequence, layout: &
                     (Some(c), Some(s)) if c.kind == s.kind => c.index as i32 - s.index as i32,
                     _ => 0,
                 };
-                // past the empty band of the dragged clips' kind, new tracks: any kind may grow
-                // (a linked pair dragged up grows video while its audio shifts as usual)
+                // past the last track of the dragged clips' kind, new tracks: the empty band
+                // past the rows, or the ruler zone above the top video row (a move that started on
+                // a clip can only mean grow there; the caption area between them stays rejected).
+                // Any kind may grow (a linked pair dragged up grows video while audio shifts).
                 let new_track = start_row.and_then(|s| {
                     let (vh, ah) = (app.ui.timeline.video_track_h, app.ui.timeline.audio_track_h);
-                    new_track_at(seq, layout, p.y, vh, ah).filter(|(kind, _)| *kind == s.kind)
+                    if let Some(nt) = new_track_at(seq, layout, p.y, vh, ah).filter(|(kind, _)| *kind == s.kind) {
+                        return Some(nt);
+                    }
+                    if layout.row_at(p.y).is_some() || s.kind != TrackKind::Video || p.y >= layout.content.min.y {
+                        return None;
+                    }
+                    let top = layout.rows.iter().filter(|r| r.kind == TrackKind::Video).map(|r| r.rect.min.y).fold(layout.split_y, f32::min);
+                    let band = Rect::from_min_max(pos2(layout.content.min.x, top - vh), pos2(layout.content.max.x, top));
+                    Some((TrackKind::Video, band))
                 });
                 if let Some((_, band)) = new_track {
                     let (x0, x1) = (layout.x_of((first + offset).max(Tick::ZERO)), layout.x_of((last + offset).max(Tick::ZERO)));

@@ -494,11 +494,11 @@ fn select_object_masks_the_seeded_half() {
     let b = path_bbox(&s);
     assert!((b.0 - 0.0).abs() <= 3.0 && (b.1 - 0.0).abs() <= 3.0, "{b:?}");
     assert!((b.2 - 160.0).abs() <= 3.0 && (b.3 - 240.0).abs() <= 3.0, "{b:?}");
-    // a box seeds from its centre: the right half this time
-    let r = s.execute("masks.selectObject", json!({"clip": clip.0, "box": [160, 0, 160, 240], "feather": 1.5})).unwrap();
+    // a box cuts the background from its border (with margin) and keeps the red strip
+    let r = s.execute("masks.selectObject", json!({"clip": clip.0, "box": [150, 10, 180, 220], "feather": 1.5})).unwrap();
     assert_eq!(r["name"], "Object (2)");
     let b = path_bbox(&s);
-    assert!((b.0 - 160.0).abs() <= 3.0 && (b.2 - 320.0).abs() <= 3.0, "{b:?}");
+    assert!((b.0 - 150.0).abs() <= 3.0 && (b.2 - 160.0).abs() <= 3.0, "{b:?}");
     // one undo step per selection
     s.execute("edit.undo", json!({})).unwrap();
     assert_eq!(s.execute("masks.list", json!({})) .unwrap()["masks"].as_array().unwrap().len(), 1);
@@ -509,15 +509,15 @@ fn select_object_masks_the_seeded_half() {
 #[test]
 fn select_human_is_the_person_preset_and_can_track() {
     let (mut s, clip) = flat_session();
-    let r = s.execute("masks.selectHuman", json!({"clip": clip.0, "box": [0, 0, 160, 240], "track": "none"})).unwrap();
+    let r = s.execute("masks.selectHuman", json!({"clip": clip.0, "box": [0, 0, 180, 240], "track": "none"})).unwrap();
     assert_eq!(r["name"], "Human (1)");
     assert!(r["track"].is_null());
     let b = path_bbox(&s);
-    assert!((b.2 - 160.0).abs() <= 3.0, "{b:?}");
+    assert!((b.0 - 160.0).abs() <= 3.0 && (b.2 - 180.0).abs() <= 3.0, "{b:?}");
     // tracking starts as a background job from the same call
     let r = s.execute("masks.selectHuman", json!({"clip": clip.0, "point": [240, 120]})).unwrap();
     let job = r["track"]["job"].as_u64().expect("a track job started: {r}");
-    s.execute("jobs.cancel", json!({"job": job})).unwrap();
+    let _ = s.execute("jobs.cancel", json!({"job": job}));
     let t0 = std::time::Instant::now();
     while !s.mask_jobs.is_empty() && t0.elapsed().as_secs() < 60 {
         s.poll_persistence();

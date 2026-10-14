@@ -46,13 +46,13 @@ pub(crate) fn commands() -> Vec<CommandSpec> {
         spec(
             "masks.selectObject",
             "Select Object",
-            r#"{"clip":id?,"effect":index|id?="opacity","point":[x,y]? (clip pixels: grow from here),"box":[x,y,w,h]? (clip pixels: grow from its centre; one of `point`/`box` is required),"tolerance":0..100?=25 (colour leeway),"feather":px?=0,"track":"forward"|"backward"? (track the new mask right away)}"#,
+            r#"{"clip":id?,"effect":index|id?="opacity","point":[x,y]? (clip pixels: grow from here),"box":[x,y,w,h]? (clip pixels: leave background margin around the object; the background is cut from its border),"tolerance":0..100?=25 (colour leeway),"feather":px?=0,"preview":bool?=false (outline only: no mask, no track),"track":"forward"|"backward"? (track the new mask right away)}"#,
             |s, p| select_subject(s, p, false),
         ),
         spec(
             "masks.selectHuman",
             "Select Human",
-            r#"{"clip":id?,"effect":index|id?="opacity","box":[x,y,w,h]? (clip pixels: drag around the person),"point":[x,y]? (clip pixels; one of `box`/`point` is required),"tolerance":0..100?=25,"feather":px?=2,"track":"forward"|"backward"|"none"?="forward" (the mask follows the person)}"#,
+            r#"{"clip":id?,"effect":index|id?="opacity","box":[x,y,w,h]? (clip pixels: drag around the person),"point":[x,y]? (clip pixels; one of `box`/`point` is required),"tolerance":0..100?=25,"feather":px?=2,"preview":bool?=false,"track":"forward"|"backward"|"none"?="forward" (the mask follows the person)}"#,
             |s, p| select_subject(s, p, true),
         ),
         spec(
@@ -305,6 +305,12 @@ fn push_mask(s: &mut Session, clip: ClipId, eff: Option<Value>, prefix: &str, pa
     })
 }
 
+/// A selection seed in clip pixels: one point, or a box (x, y, w, h).
+enum Seed {
+    Point(Vec2),
+    Box(f64, f64, f64, f64),
+}
+
 /// Select an object (or a person) as an editable vector mask: grow the seed into its region,
 /// trace and simplify the boundary, add the mask, and optionally track it right away.
 ///
@@ -323,20 +329,23 @@ fn select_subject(s: &mut Session, p: &Value, human: bool) -> Result<Value> {
     if sw < 1.0 || sh < 1.0 {
         return Err(bad(cmd, "the clip has no picture"));
     }
-    // seed in clip pixels: a point, or the centre of a box
-    let seed = match (p.get("point").and_then(pt), p.get("box")) {
-        (Some(q), None) => q,
+    // seed in clip pixels: a point, or a box (the background is cut from its border)
+    let seed_box = match (p.get("point").and_then(pt), p.get("box")) {
+        (Some(q), None) => Seed::Point(q),
         (None, Some(b)) => {
             let (x, y, w, h) = (b.get(0).and_then(Value::as_f64), b.get(1).and_then(Value::as_f64), b.get(2).and_then(Value::as_f64), b.get(3).and_then(Value::as_f64));
             match (x, y, w, h) {
-                (Some(x), Some(y), Some(w), Some(h)) if w > 0.0 && h > 0.0 => Vec2::new(x + w / 2.0, y + h / 2.0),
+                (Some(x), Some(y), Some(w), Some(h)) if w > 0.0 && h > 0.0 => Seed::Box(x, y, w, h),
                 _ => return Err(bad(cmd, "`box` is [x, y, w, h] in clip pixels with w, h > 0")),
             }
         }
         _ => return Err(bad(cmd, "give exactly one of `point` ([x, y]) or `box` ([x, y, w, h])")),
     };
-    if !(0.0..sw).contains(&seed.x) || !(0.0..sh).contains(&seed.y) {
-        return Err(bad(cmd, "the seed is outside the picture"));
+    // the seed must touch the picture at all
+    match &seed_box {
+        Seed::Point(q) if !(0.0..sw).contains(&q.x) || !(0.0..sh).contains(&q.y) => return Err(bad(cmd, "the seed is outside the picture")),
+        Seed::Box(x, y, _, _) if *x >= sw || *y >= sh || *x < 0.0 || *y < 0.0 => return Err(bad(cmd, "the seed is outside the picture")),
+        _ => {}
     }
     let tolerance = match f64_p(p, "tolerance") {
         Some(t) if !t.is_finite() || t < 0.0 || t > 100.0 => return Err(bad(cmd, "`tolerance` is 0..100")),
@@ -372,23 +381,63 @@ fn select_subject(s: &mut Session, p: &Value, human: bool) -> Result<Value> {
         return Err(bad(cmd, "can't decode the frame at the playhead"));
     }
     let rgba = fr.to_rgba8();
-    let seed_f = (((seed.x / sw * fw as f64).round() as i64).clamp(0, fw as i64 - 1).max(0) as u32, ((seed.y / sh * fh as f64).round() as i64).clamp(0, fh as i64 - 1).max(0) as u32);
+    // frame pixels → clip pixels
+    let (kx, ky) = (sw / fw as f64, sh / fh as f64);
+    let to_clip = |poly: Vec<(f64, f64)>| poly.into_iter().map(|(x, y)| (x * kx, y * ky)).collect::<Vec<_>>();
     let threshold = (tolerance * 1.6).round().clamp(0.0, 255.0) as u8;
-    let poly = filmcraft_render::segment::object_polygon(&rgba, fw, fh, seed_f, threshold).map_err(|e| {
+    let segment_err = |e| {
         bad(
             cmd,
             match e {
                 filmcraft_render::segment::SegmentError::SeedOutside => "the seed is outside the picture",
-                filmcraft_render::segment::SegmentError::NothingFound => "nothing found there: click inside the object, or raise `tolerance`",
-                filmcraft_render::segment::SegmentError::TooComplex => "too much detail: raise `tolerance` to merge it",
+                filmcraft_render::segment::SegmentError::NothingFound => "nothing found there: click inside the object, drag a box around it, or raise `tolerance`",
+                filmcraft_render::segment::SegmentError::TooComplex => "too much detail: raise `tolerance` to merge it, or drag a tighter box",
                 filmcraft_render::segment::SegmentError::InvalidInput => "can't read the frame at the playhead",
             },
         )
-    })?;
-    // frame pixels → clip pixels
-    let (kx, ky) = (sw / fw as f64, sh / fh as f64);
-    let path = filmcraft_render::segment::polygon_to_path(&poly.iter().map(|(x, y)| (x * kx, y * ky)).collect::<Vec<_>>());
+    };
+    let poly = match seed_box {
+        // a box cuts the background from its border and keeps the biggest island inside: this
+        // handles multicolour objects on complex scenes, where the background is what matches
+        Seed::Box(x, y, w, h) => {
+            let to_frame = |v: f64, size: f64, full: usize| ((v / size * full as f64).round() as i64).clamp(0, full as i64).max(0) as u32;
+            let fb = (to_frame(x, sw, fw), to_frame(y, sh, fh), to_frame(x + w, sw, fw).saturating_sub(to_frame(x, sw, fw)), to_frame(y + h, sh, fh).saturating_sub(to_frame(y, sh, fh)));
+            to_clip(filmcraft_render::segment::boxed_object_polygon(&rgba, fw, fh, fb, threshold).map_err(segment_err)?)
+        }
+        // a point grows from one colour: escalate the tolerance when the first try is a speck,
+        // so clicks on textured objects still land
+        Seed::Point(q) => {
+            let seed_f = (((q.x / sw * fw as f64).round() as i64).clamp(0, fw as i64 - 1).max(0) as u32, ((q.y / sh * fh as f64).round() as i64).clamp(0, fh as i64 - 1).max(0) as u32);
+            let mut threshold = threshold;
+            let poly = loop {
+                match filmcraft_render::segment::object_polygon(&rgba, fw, fh, seed_f, threshold) {
+                    Ok(poly) => break poly,
+                    Err(filmcraft_render::segment::SegmentError::NothingFound) if threshold < 255 => {
+                        threshold = threshold.saturating_add((threshold / 2).max(8)).min(255);
+                        continue;
+                    }
+                    Err(e) => return Err(segment_err(e)),
+                }
+            };
+            to_clip(poly)
+        }
+    };
+    let path = filmcraft_render::segment::polygon_to_path(&poly);
     let vertices = path.len();
+    // preview outlines without changing anything: the monitor draws the blue frame first,
+    // OK runs the same call again to create the mask
+    if p.get("preview").and_then(Value::as_bool).unwrap_or(false) {
+        let (mut x0, mut y0, mut x1, mut y1) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
+        let mut outline = Vec::new();
+        for v in &path.vertices {
+            x0 = x0.min(v.p.x);
+            y0 = y0.min(v.p.y);
+            x1 = x1.max(v.p.x);
+            y1 = y1.max(v.p.y);
+            outline.push([v.p.x, v.p.y]);
+        }
+        return Ok(json!({"vertices": vertices, "outline": outline, "bbox": [x0, y0, x1, y1]}));
+    }
     let eff = p.get("effect").cloned();
     let prefix = if human { "Human" } else { "Object" };
     let label = if human { "Select Human" } else { "Select Object" };

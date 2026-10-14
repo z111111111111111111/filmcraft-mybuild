@@ -595,25 +595,79 @@ fn object_overlay(app: &mut FilmcraftApp, ui: &mut egui::Ui, pic: Rect, frame: (
         app.ui.status = "Move the playhead over the clip, then click an object to mask it".into();
         return;
     }
+/// A computed outline waiting for confirmation: the seed params (without `clip`), the
+/// outline and anchor in clip pixels, and the playhead it was computed at (moving the
+/// playhead drops it, since it belongs to another frame).
+#[derive(Clone)]
+struct PendingOutline {
+    clip: u64,
+    human: bool,
+    params: Value,
+    outline: Vec<[f64; 2]>,
+    at: [f64; 2],
+    tick: Tick,
+}
+
+fn pending_id(id: &str) -> egui::Id {
+    egui::Id::new(id).with("pending")
+}
+
+/// Object / Human Select on the Program monitor: click seeds a point, dragging seeds a box.
+/// The outline is computed at once and shown as a blue frame with OK / Cancel beside it;
+/// confirming creates the editable vector mask (Human tracks it forward). After a selection
+/// the tool returns to Selection so the new outline is editable at once.
+fn object_overlay(app: &mut FilmcraftApp, ui: &mut egui::Ui, pic: Rect, frame: (u32, u32)) {
+    let human = app.ui.tool == Tool::HumanSelect;
+    let id = if human { "human-select" } else { "object-select" };
+    let clip = app.session.active_sequence().and_then(|q| {
+        app.session.state.selected_mask.map(|m| m.clip).or_else(|| {
+            app.session.state.selection.iter().copied().find(|c| {
+                q.find_item(*c).and_then(|(t, _)| q.track(t)).is_some_and(|t| t.kind == TrackKind::Video)
+            })
+        })
+    });
+    let Some(clip) = clip else {
+        app.ui.status = "Select a video clip first, then click an object to mask it".into();
+        return;
+    };
+    let Some(it) = app.session.active_sequence().and_then(|q| q.find_item(clip)).map(|(_, i)| i.clone()) else { return };
+    let ph = app.session.playhead();
+    if ph < it.start || ph >= it.end() {
+        app.ui.status = "Move the playhead over the clip, then click an object to mask it".into();
+        return;
+    }
     let mt = it.source_time_at(ph);
-    let Some(to_clip) = clip_to_screen(app, &it, mt, pic, frame).and_then(|m| m.inverse()) else {
+    let Some(to_screen) = clip_to_screen(app, &it, mt, pic, frame) else {
+        app.ui.status = "Select a video clip first, then click an object to mask it".into();
+        return;
+    };
+    let Some(to_clip) = to_screen.inverse() else {
         app.ui.status = "Select a video clip first, then click an object to mask it".into();
         return;
     };
     let to_c = |p: Pos2| to_clip.apply(Vec2::new(p.x as f64, p.y as f64));
+    let to_s = |q: [f64; 2]| sp(&to_screen, Vec2::new(q[0], q[1]));
+    // a pending outline for another clip, tool or frame is stale
+    if ui
+        .data(|m| m.get_temp::<PendingOutline>(pending_id(id)))
+        .is_some_and(|p| p.clip != clip.0 || p.human != human || p.tick != ph)
+    {
+        ui.data_mut(|m| m.remove::<PendingOutline>(pending_id(id)));
+    }
     let resp = ui.interact(pic, egui::Id::new(id), Sense::click_and_drag());
     app.auto.add(if human { "program.humanSelect" } else { "program.objectSelect" }, pic, if human { "Human Select" } else { "Object Select" });
     if resp.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
     }
     // press origin of a drag (a pure click never stores one); `placed` tells a release-click
-    // after a drag apart from a pure click, so exactly one of the two commits below runs
+    // after a drag apart from a pure click, so exactly one preview below runs
     let start_id = egui::Id::new(id).with("start");
     let placed_id = egui::Id::new(id).with("placed");
     if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
         ui.data_mut(|m| {
             m.remove::<Pos2>(start_id);
             m.remove::<bool>(placed_id);
+            m.remove::<PendingOutline>(pending_id(id));
         });
         return;
     }
@@ -632,14 +686,15 @@ fn object_overlay(app: &mut FilmcraftApp, ui: &mut egui::Ui, pic: Rect, frame: (
             }
         }
     }
-    // a pure click seeds a point (a drag stores a start first, so this never double-commits)
+    // a pure click or a finished drag previews the outline first (blue frame + OK / Cancel);
+    // nothing is created until OK
+    let mut seed: Option<Value> = None;
     if resp.clicked_by(LEFT) && !ui.data(|m| m.get_temp::<bool>(placed_id)).unwrap_or(false) {
         if let Some(p) = resp.interact_pointer_pos() {
             let c = to_c(p);
-            select_at(app, clip, human, json!({"point": [c.x, c.y]}));
+            seed = Some(json!({"point": [c.x, c.y], "at": [c.x, c.y]}));
         }
     }
-    // release after a drag seeds a box, or a point when the pointer barely moved
     if resp.drag_stopped_by(LEFT) {
         let start = ui.data(|m| m.get_temp::<Pos2>(start_id));
         ui.data_mut(|m| {
@@ -647,15 +702,75 @@ fn object_overlay(app: &mut FilmcraftApp, ui: &mut egui::Ui, pic: Rect, frame: (
             m.remove::<bool>(placed_id);
         });
         if let (Some(a), Some(b)) = (start, resp.interact_pointer_pos()) {
-            let params = if (b - a).length() > 6.0 {
+            seed = Some(if (b - a).length() > 6.0 {
                 let r = Rect::from_two_pos(a, b);
                 let (p0, p1) = (to_c(r.min), to_c(r.max));
-                json!({"box": [p0.x, p0.y, p1.x - p0.x, p1.y - p0.y]})
+                json!({"box": [p0.x, p0.y, p1.x - p0.x, p1.y - p0.y], "at": [(p0.x + p1.x) / 2.0, (p0.y + p1.y) / 2.0]})
             } else {
                 let c = to_c(b);
-                json!({"point": [c.x, c.y]})
-            };
-            select_at(app, clip, human, params);
+                json!({"point": [c.x, c.y], "at": [c.x, c.y]})
+            });
+        }
+    }
+    if let Some(mut params) = seed {
+        let at = params.get("at").cloned().unwrap_or(Value::Null);
+        if let Some(o) = params.as_object_mut() {
+            o.remove("at");
+        }
+        params["clip"] = json!(clip.0);
+        params["preview"] = json!(true);
+        let cmd = if human { "masks.selectHuman" } else { "masks.selectObject" };
+        match app.session.execute(cmd, params.clone()) {
+            Ok(r) => {
+                let outline: Vec<[f64; 2]> = r.get("outline").and_then(Value::as_array).map(|a| a.iter().filter_map(|v| Some([v.get(0)?.as_f64()?, v.get(1)?.as_f64()?])).collect()).unwrap_or_default();
+                let at: [f64; 2] = [at.get(0).and_then(Value::as_f64).unwrap_or(0.0), at.get(1).and_then(Value::as_f64).unwrap_or(0.0)];
+                if let Some(o) = params.as_object_mut() {
+                    o.remove("preview");
+                }
+                ui.data_mut(|m| m.insert_temp(pending_id(id), PendingOutline { clip: clip.0, human, params, outline, at, tick: ph }));
+            }
+            Err(e) => app.ui.status = e.to_string(),
+        }
+    }
+    // the pending blue frame with OK / Cancel at the seed point
+    if let Some(pending) = ui.data(|m| m.get_temp::<PendingOutline>(pending_id(id))) {
+        let pts: Vec<Pos2> = pending.outline.iter().map(|q| to_s(*q)).collect();
+        let painter = ui.painter().with_clip_rect(pic);
+        if pts.len() >= 3 {
+            let mut closed = pts.clone();
+            if let Some(f) = pts.first().copied() {
+                closed.push(f);
+            }
+            painter.add(egui::Shape::line(closed, Stroke::new(2.0, Color32::from_rgb(0x5a, 0xb4, 0xff))));
+        }
+        let anchor = to_s(pending.at);
+        let ok_label = tl!("OK");
+        let cancel_label = tl!("Cancel");
+        let ok_w = painter.layout_no_wrap(ok_label.to_string(), Tokens::ui(12.0), Color32::WHITE).size().x + 20.0;
+        let cancel_w = painter.layout_no_wrap(cancel_label.to_string(), Tokens::ui(12.0), Color32::WHITE).size().x + 20.0;
+        let mut bx = anchor.x + 12.0;
+        bx = bx.min(pic.max.x - ok_w - cancel_w - 16.0).max(pic.min.x + 4.0);
+        let by = (anchor.y - 14.0).clamp(pic.min.y + 4.0, pic.max.y - 30.0);
+        let ok_r = Rect::from_min_size(pos2(bx, by), vec2(ok_w, 24.0));
+        let cancel_r = Rect::from_min_size(pos2(bx + ok_w + 8.0, by), vec2(cancel_w, 24.0));
+        for (r, label, fill) in [(ok_r, ok_label, app.tokens.accent), (cancel_r, cancel_label, app.tokens.field_bg)] {
+            painter.rect_filled(r, 4.0, fill);
+            painter.text(r.center(), Align2::CENTER_CENTER, label, Tokens::ui(12.0), Color32::WHITE);
+        }
+        let ok = ui.interact(ok_r, egui::Id::new(id).with("ok"), Sense::click());
+        let cancel = ui.interact(cancel_r, egui::Id::new(id).with("cancel"), Sense::click());
+        app.auto.add(&format!("program.{}.ok", if human { "humanSelect" } else { "objectSelect" }), ok_r, ok_label);
+        app.auto.add(&format!("program.{}.cancel", if human { "humanSelect" } else { "objectSelect" }), cancel_r, cancel_label);
+        if ok.clicked() {
+            let pending = ui.data(|m| m.get_temp::<PendingOutline>(pending_id(id)));
+            ui.data_mut(|m| m.remove::<PendingOutline>(pending_id(id)));
+            if let Some(pending) = pending {
+                select_at(app, clip, human, pending.params);
+            }
+        }
+        if cancel.clicked() {
+            ui.data_mut(|m| m.remove::<PendingOutline>(pending_id(id)));
+            app.ui.status = tl!("Selection discarded").into();
         }
     }
 }
@@ -667,8 +782,8 @@ fn select_at(app: &mut FilmcraftApp, clip: ClipId, human: bool, mut params: Valu
     let cmd = if human { "masks.selectHuman" } else { "masks.selectObject" };
     match app.session.execute(cmd, params) {
         Ok(r) => {
-            let n = r["vertices"].as_u64().unwrap_or(0);
-            app.ui.status = format!("{} mask with {n} points — drag its vertices to refine it", r["name"].as_str().unwrap_or("Object"));
+            let n = r.get("vertices").and_then(Value::as_u64).unwrap_or(0);
+            app.ui.status = format!("{} mask with {n} points — drag its vertices to refine it", r.get("name").and_then(Value::as_str).unwrap_or("Object"));
             app.ui.tool = Tool::Selection;
         }
         Err(e) => app.ui.status = e.to_string(),
