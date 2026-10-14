@@ -1,8 +1,8 @@
 //! The font picker dropdown shared by every font field: search-as-you-type, starred
-//! favorites, recent picks, then all families. Every row renders in its own typeface where the
-//! interface fonts cover it (bundled, craft-fonts and the installed CJK / right-to-left faces);
-//! other families fall back to the interface face. Favorites and recents live in the graphics
-//! preferences, so every picker shares them.
+//! favorites, recent picks, then all families. Every row renders in its own typeface (bound
+//! into the interface on first hover, so system faces preview too); families with missing or
+//! unreadable files fall back to the interface face with a note. Favorites and recents live in
+//! the graphics preferences, so every picker shares them.
 //!
 //! Automation: `${auto_id}` (the combo) and `${auto_id}.option.<family>` (visible rows).
 
@@ -75,6 +75,44 @@ fn section_head(ui: &mut Ui, text: &str, t: Tokens) {
     ui.label(RichText::new(text).size(11.0).color(t.text_dim).strong());
 }
 
+/// The style to bind for a row preview: Regular when the family has one, else its first style
+/// (the resolver picks the nearest weight anyway).
+fn preview_style(styles: &[String]) -> &str {
+    styles.iter().find(|s| s.eq_ignore_ascii_case("regular")).map(String::as_str).unwrap_or_else(|| styles.first().map(String::as_str).unwrap_or(""))
+}
+
+/// Bind `family` into the egui context so its picker row can preview in its own typeface.
+/// Only names already in `registered` (read at the top of the frame) are ever *used* for
+/// drawing: a name is usable from the frame after it is inserted, never the same frame (using
+/// it earlier panics inside epaint instead of falling back). Families whose files are missing
+/// or unreadable stay in `failed`, so the disk is read once per family, not every frame.
+fn ensure_bound(ui: &Ui, families: &[(String, Vec<String>)], registered: &std::collections::HashSet<String>, failed: &mut std::collections::HashSet<String>, family: &str) {
+    if registered.contains(family) || !failed.insert(family.to_string()) {
+        return;
+    }
+    let style = families.iter().find(|(f, _)| f == family).map(|(_, st)| preview_style(st).to_string()).unwrap_or_default();
+    let r = filmcraft_text::fonts::resolve(family, &style);
+    if r.missing {
+        return;
+    }
+    let bytes: Option<Vec<u8>> = match &filmcraft_text::fonts::face(r.face).info.data {
+        filmcraft_text::fonts::FaceData::Static(b) => Some(b.to_vec()),
+        filmcraft_text::fonts::FaceData::Shared(a) => Some(a.to_vec()),
+        filmcraft_text::fonts::FaceData::File(p) => std::fs::read(p).ok(),
+    };
+    let Some(bytes) = bytes else { return };
+    let mut defs = ui.ctx().fonts_mut(|f| f.definitions().clone());
+    let key = format!("doc:{family}");
+    if defs.font_data.contains_key(key.as_str()) {
+        failed.remove(family);
+        return;
+    }
+    defs.font_data.insert(key.clone(), std::sync::Arc::new(egui::FontData::from_owned(bytes)));
+    defs.families.entry(egui::FontFamily::Name(family.into())).or_default().push(key);
+    ui.ctx().set_fonts(defs);
+    failed.remove(family);
+}
+
 /// A font dropdown for the family `current`. Returns the picked family (if any) and the combo
 /// response (for automation ids). Typing filters; Enter picks the exact match, else the first
 /// filtered family.
@@ -101,6 +139,13 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut Ui, id_salt: &str, current: &str, w
     });
     let search_id = (id_salt.to_string(), "font-search");
     let search_id = egui::Id::new(search_id);
+    // families whose files are missing or unreadable: remembered per picker so scrolling does
+    // not re-read the disk every frame
+    let failed_id = egui::Id::new((id_salt.to_string(), "font-bind-failed"));
+    let mut failed: std::collections::HashSet<String> = ui.data(|d| d.get_temp(failed_id)).unwrap_or_default();
+    let failed_before = failed.len();
+    // the family in use previews too, bound on open when it is not already
+    ensure_bound(ui, &families, &registered, &mut failed, current);
     let mut picked: Option<String> = None;
     let combo = egui::ComboBox::from_id_salt((id_salt.to_string(), "combo"))
         .selected_text(current)
@@ -142,6 +187,11 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut Ui, id_salt: &str, current: &str, w
                                 RichText::new(fam).size(12.0)
                             };
                             let row = ui.selectable_label(false, face);
+                            // bind on hover: the row previews in its own typeface from the next
+                            // frame on (see `ensure_bound`)
+                            if row.hovered() {
+                                ensure_bound(ui, &families, &registered, &mut failed, fam);
+                            }
                             let visible = row.rect.intersect(ui.clip_rect());
                             if visible.is_positive() {
                                 app.auto.add(&format!("{auto_id}.option.{fam}"), visible, fam);
@@ -167,6 +217,9 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut Ui, id_salt: &str, current: &str, w
     if let Some(fam) = picked.clone() {
         remember(app, &fam);
     }
+    if failed.len() != failed_before {
+        ui.data_mut(|d| d.insert_temp(failed_id, failed.clone()));
+    }
     app.auto.add(auto_id, combo.response.rect, current);
     (picked, combo.response)
 }
@@ -190,5 +243,13 @@ mod tests {
         assert_eq!(filtered[2].1, vec!["Noto Sans Arabic".to_string()]);
         let missing = sections(&fams(), &["Gone".into()], &[], "");
         assert!(missing[0].1.is_empty(), "uninstalled favorites hide");
+    }
+
+    #[test]
+    fn preview_prefers_regular_then_first() {
+        assert_eq!(preview_style(&["Bold".into(), "Regular".into()]), "Regular");
+        assert_eq!(preview_style(&["regular".into()]), "regular");
+        assert_eq!(preview_style(&["Bold".into(), "Italic".into()]), "Bold");
+        assert_eq!(preview_style(&[]), "");
     }
 }

@@ -472,8 +472,10 @@ fn flat_session() -> (Session, ClipId) {
 }
 
 fn path_bbox(s: &mut Session) -> (f64, f64, f64, f64) {
+    // the newest mask: `masks.list` is in creation order, like the effect's own list
     let l = s.execute("masks.list", json!({})).unwrap();
-    let vs = l["masks"][0]["path"]["vertices"].as_array().unwrap();
+    let ms = l["masks"].as_array().unwrap();
+    let vs = ms.last().unwrap()["path"]["vertices"].as_array().unwrap();
     let mut b = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
     for v in vs {
         let (x, y) = (v["p"][0].as_f64().unwrap(), v["p"][1].as_f64().unwrap());

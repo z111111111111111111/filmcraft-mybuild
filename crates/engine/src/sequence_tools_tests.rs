@@ -618,7 +618,8 @@ fn go_to_in_out_without_marks_go_to_the_sequence_ends() {
 }
 
 /// #483: media dropped in the empty space past the last track goes on a new track (with
-/// `"new"`), one undo step; a placement that fails leaves no new track behind.
+/// `"new"`), one undo step; naming a far track (`A99`) grows to it in chunks in the same step;
+/// past the cap (`A1000`) the placement fails and leaves no new track behind.
 #[test]
 fn place_on_new_tracks_adds_them_in_one_undo_step() {
     let (mut s, item) = fresh();
@@ -643,8 +644,18 @@ fn place_on_new_tracks_adds_them_in_one_undo_step() {
     assert_eq!((q.video_tracks[nv].items.len(), q.audio_tracks[0].items.len()), (1, 1));
     s.execute("edit.undo", json!({})).unwrap();
 
-    // a placement that fails after the tracks were added: nothing changes
-    assert!(s.execute("timeline.place", json!({"item": item, "track": "new", "audioTrack": "A99", "time": 0})).is_err());
+    // naming a far track grows to it in chunks, still one undo step with the place
+    let r = s.execute("timeline.place", json!({"item": item, "track": "new", "audioTrack": "A99", "time": 0})).unwrap();
+    let q = s.active_sequence().unwrap();
+    assert_eq!(q.audio_tracks.len(), 99, "grown out to A99");
+    assert_eq!(q.audio_tracks[98].items.len(), 1, "the sound lands on A99");
+    assert_eq!(r["clips"].as_array().unwrap().len(), 2);
+    assert_eq!(s.history.undo.len(), undo + 1, "growth folds into the place step");
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(*s.active_sequence().unwrap(), before);
+
+    // past the cap the place fails and leaves no new track behind
+    assert!(s.execute("timeline.place", json!({"item": item, "track": "new", "audioTrack": "A1000", "time": 0})).is_err());
     assert_eq!(*s.active_sequence().unwrap(), before);
     assert_eq!(s.history.undo.len(), undo);
 }
