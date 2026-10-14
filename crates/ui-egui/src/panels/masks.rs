@@ -762,8 +762,13 @@ fn select_at(app: &mut FilmcraftApp, clip: ClipId, human: bool, mut params: Valu
     let cmd = if human { "masks.selectHuman" } else { "masks.selectObject" };
     match app.session.execute(cmd, params) {
         Ok(r) => {
-            let n = r.get("vertices").and_then(Value::as_u64).unwrap_or(0);
-            app.ui.status = format!("{} mask with {n} points — drag its vertices to refine it", r.get("name").and_then(Value::as_str).unwrap_or("Object"));
+            if r.get("engine").and_then(Value::as_str) == Some("ml") {
+                let name = r.get("name").and_then(Value::as_str).unwrap_or("AI mask");
+                app.ui.status = format!("{name} — AI subject mask (soft edges)");
+            } else {
+                let n = r.get("vertices").and_then(Value::as_u64).unwrap_or(0);
+                app.ui.status = format!("{} mask with {n} points — drag its vertices to refine it", r.get("name").and_then(Value::as_str).unwrap_or("Object"));
+            }
             app.ui.tool = Tool::Selection;
         }
         Err(e) => app.ui.status = e.to_string(),

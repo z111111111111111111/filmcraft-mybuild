@@ -16,6 +16,9 @@ default = []
 whisper = ["filmcraft-engine/whisper", "filmcraft-engine/speech-download"]
 # Natural Text to Speech voices (Kokoro-82M on the CPU, downloaded on first use).
 neural-voices = ["filmcraft-engine/neural-voices"]
+# AI subject segmentation (Object / Human Select) with SAM 2 / BiRefNet on the CPU, and model
+# downloads. Off by default, so the default build stays pure Rust.
+segment = ["filmcraft-engine/segment", "filmcraft-engine/segment-download"]
 
 [dependencies]
 filmcraft-engine = { workspace = true }

@@ -373,6 +373,78 @@ impl TrackMethod {
     }
 }
 
+/// A soft (bitmap) coverage raster behind an AI-segmented mask (Object Select / Human Select
+/// with a downloaded model; schema v17).
+///
+/// The model returns 8-bit alpha at its working resolution covering the **whole frame**, so the
+/// raster is independent of the clip's pixel size: coverage is sampled by normalized position.
+/// It is stored run-length encoded to keep project files small — row-major triples
+/// `[value, run_lo, run_hi]` where a run is a little-endian `u16` (`1..=65535`, longer runs split),
+/// exactly the coding the segmentation crate produces. A mask with a raster ignores its Bézier
+/// `path` (which is left empty); it still honours opacity, inversion and the combine [`MaskMode`],
+/// which makes a soft subject mask composable with hand-drawn masks the usual way.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MaskRaster {
+    pub width: u32,
+    pub height: u32,
+    /// Row-major run-length code (see the type docs).
+    pub rle: Vec<u8>,
+}
+
+impl MaskRaster {
+    /// Largest raster we accept: 2^26 pixels (about 64 MiB of alpha) so hostile project or model
+    /// data cannot exhaust memory.
+    pub const MAX_PIXELS: u64 = 1 << 26;
+
+    /// The pixel count when `width`/`height` are valid (non-zero, within the cap), else `None`.
+    pub fn pixels(&self) -> Option<usize> {
+        let n = (self.width as u64).checked_mul(self.height as u64)?;
+        (n != 0 && n <= Self::MAX_PIXELS).then_some(n as usize)
+    }
+
+    /// Encode row-major alpha of exactly `width * height` bytes; `None` on a size mismatch or an
+    /// out-of-range size.
+    pub fn from_alpha(width: u32, height: u32, alpha: &[u8]) -> Option<Self> {
+        let r = MaskRaster { width, height, rle: Vec::new() };
+        let n = r.pixels()?;
+        if alpha.len() != n {
+            return None;
+        }
+        let mut rle = Vec::new();
+        let mut i = 0usize;
+        while i < n {
+            let v = alpha[i];
+            let mut run = 1usize;
+            while i + run < n && alpha[i + run] == v && run < u16::MAX as usize {
+                run += 1;
+            }
+            rle.push(v);
+            rle.extend_from_slice(&(run as u16).to_le_bytes());
+            i += run;
+        }
+        Some(MaskRaster { width, height, rle })
+    }
+
+    /// Decode to row-major alpha of `width * height` bytes; `None` if the runs do not cover exactly
+    /// the frame (a corrupt or hostile encoding).
+    pub fn decode(&self) -> Option<Vec<u8>> {
+        let n = self.pixels()?;
+        if self.rle.len() % 3 != 0 {
+            return None;
+        }
+        let mut alpha = Vec::with_capacity(n);
+        for run in self.rle.chunks_exact(3) {
+            let value = run[0];
+            let len = u16::from_le_bytes([run[1], run[2]]) as usize;
+            if len == 0 || alpha.len() + len > n {
+                return None;
+            }
+            alpha.resize(alpha.len() + len, value);
+        }
+        (alpha.len() == n).then_some(alpha)
+    }
+}
+
 /// A mask on an effect instance.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Mask {
@@ -391,6 +463,10 @@ pub struct Mask {
     pub mode: MaskMode,
     #[serde(default)]
     pub track_method: TrackMethod,
+    /// Soft coverage raster of an AI-segmented mask; when set, `path` is empty and this drives the
+    /// mask's coverage (schema v17).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raster: Option<MaskRaster>,
 }
 
 /// Mask parameter ids (keyframe commands address them with `"mask": n`).
@@ -407,7 +483,18 @@ impl Mask {
             inverted: false,
             mode: MaskMode::Add,
             track_method: TrackMethod::default(),
+            raster: None,
         }
+    }
+    /// A soft AI mask from a coverage raster (its Bézier `path` is empty).
+    pub fn from_raster(name: impl Into<String>, raster: MaskRaster) -> Self {
+        let mut m = Self::new(name, MaskPath::default());
+        m.raster = Some(raster);
+        m
+    }
+    /// Whether this mask is driven by a soft coverage raster instead of its Bézier path.
+    pub fn is_raster(&self) -> bool {
+        self.raster.is_some()
     }
     pub fn param(&self, id: &str) -> Option<&Param> {
         match id {
@@ -521,6 +608,39 @@ mod tests {
         let s = serde_json::to_string(&m).unwrap();
         let back: Mask = serde_json::from_str(&s).unwrap();
         assert_eq!(back, m);
+    }
+
+    #[test]
+    fn raster_encodes_decodes_and_round_trips() {
+        let alpha: Vec<u8> = (0..(32 * 8)).map(|i| (i % 5) as u8 * 60).collect();
+        let r = MaskRaster::from_alpha(32, 8, &alpha).unwrap();
+        assert_eq!(r.pixels(), Some(32 * 8));
+        assert_eq!(r.decode().unwrap(), alpha);
+        // a constant plane is one run per value change
+        let flat = MaskRaster::from_alpha(512, 1, &[200u8; 512]).unwrap();
+        assert_eq!(flat.rle.len(), 3, "one run of 512");
+        assert_eq!(flat.decode().unwrap(), vec![200u8; 512]);
+        // serde round trip through the mask
+        let m = Mask::from_raster("Object (1)", r.clone());
+        assert!(m.is_raster());
+        let back: Mask = serde_json::from_str(&serde_json::to_string(&m).unwrap()).unwrap();
+        assert_eq!(back, m);
+        // a run longer than u16::MAX is split
+        let big = MaskRaster::from_alpha(70_000, 1, &[9u8; 70_000]).unwrap();
+        assert_eq!(big.decode().unwrap(), vec![9u8; 70_000]);
+    }
+
+    #[test]
+    fn raster_rejects_hostile_input() {
+        assert!(MaskRaster::from_alpha(0, 0, &[]).is_none());
+        assert!(MaskRaster::from_alpha(2, 2, &[0, 0, 0]).is_none());
+        assert!(MaskRaster::from_alpha(1 << 14, 1 << 14, &[]).is_none(), "over the pixel cap");
+        let bad = MaskRaster { width: 2, height: 2, rle: vec![1, 5, 0] };
+        assert!(bad.decode().is_none(), "run overruns the frame");
+        let short = MaskRaster { width: 2, height: 2, rle: vec![1, 1, 0] };
+        assert!(short.decode().is_none(), "runs do not cover the frame");
+        let zero = MaskRaster { width: 2, height: 2, rle: vec![1, 0, 0] };
+        assert!(zero.decode().is_none(), "zero-length run");
     }
 
     #[test]

@@ -19,6 +19,12 @@
 //! Masks combine top to bottom with their [`MaskMode`]. All of this runs in linear light on the
 //! premultiplied working image: a masked effect is `lerp(original, effected, coverage)` per
 //! channel, an opacity mask scales the layer's premultiplied pixels.
+//!
+//! A soft AI mask ([`filmcraft_project::MaskRaster`], an Object/Human Select result) is instead a
+//! decoded 8-bit coverage plane sampled bilinearly by normalized position (it covers the whole
+//! frame, so it is independent of the working size); it honours opacity, inversion and the combine
+//! mode like a polygon mask. Raster masks are CPU-only (the WGSL shader is polygon-only and has no
+//! production caller; `crate::preview::cpu_layer` sends any masked item to the CPU path).
 
 use filmcraft_project::{EffectInstance, Mask, MaskMode};
 use filmcraft_time::Tick;
@@ -29,11 +35,42 @@ use crate::image::Image;
 /// Flattening tolerance in working pixels.
 pub const FLATTEN_TOLERANCE: f64 = 0.05;
 
+/// A decoded soft coverage plane (an AI mask's [`filmcraft_project::MaskRaster`]), 8-bit alpha at
+/// the raster's own resolution, covering the whole frame. Sampled by normalized position, so it is
+/// independent of the working image size.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RasterPlane {
+    pub width: u32,
+    pub height: u32,
+    pub alpha: Vec<u8>,
+}
+
+/// Bilinear coverage of a plane at normalized `(u, v)` in `0..=1` (edge-clamped).
+fn raster_sample(r: &RasterPlane, u: f32, v: f32) -> f32 {
+    let (rus_w, rus_h) = (r.width as usize, r.height as usize);
+    if rus_w == 0 || rus_h == 0 || r.alpha.len() < rus_w * rus_h {
+        return 0.0;
+    }
+    let (w, h) = (r.width as f32, r.height as f32);
+    // pixel-centre coordinates in the raster
+    let fx = (u * w - 0.5).clamp(0.0, (w - 1.0).max(0.0));
+    let fy = (v * h - 0.5).clamp(0.0, (h - 1.0).max(0.0));
+    let (x0, y0) = (fx.floor() as usize, fy.floor() as usize);
+    let (x1, y1) = ((x0 + 1).min(rus_w - 1), (y0 + 1).min(rus_h - 1));
+    let (wx, wy) = (fx - x0 as f32, fy - y0 as f32);
+    let at = |x: usize, y: usize| r.alpha.get(y * rus_w + x).copied().unwrap_or(0) as f32;
+    let top = at(x0, y0) * (1.0 - wx) + at(x1, y0) * wx;
+    let bottom = at(x0, y1) * (1.0 - wx) + at(x1, y1) * wx;
+    ((top * (1.0 - wy) + bottom * wy) / 255.0).clamp(0.0, 1.0)
+}
+
 /// One mask ready for rasterizing, in working-image pixels.
 #[derive(Clone, Debug, PartialEq)]
 pub struct FlatMask {
-    /// Closed polygon (last vertex connects to the first).
+    /// Closed polygon (last vertex connects to the first). Empty for a soft [`FlatMask::raster`].
     pub pts: Vec<[f32; 2]>,
+    /// A soft coverage plane (an AI mask); when set, coverage comes from it and `pts` is empty.
+    pub raster: Option<RasterPlane>,
     pub feather: f32,
     pub expansion: f32,
     /// 0..1.
@@ -49,10 +86,19 @@ pub fn prepare(masks: &[Mask], t: Tick, px_scale: f32) -> Vec<FlatMask> {
         .iter()
         .filter(|m| m.mode != MaskMode::None)
         .map(|m| {
-            let path = m.path_at(t);
-            let pts = path.flatten(FLATTEN_TOLERANCE / s.max(1e-6)).into_iter().map(|p| [(p.x * s) as f32, (p.y * s) as f32]).collect();
+            let raster = m.raster.as_ref().and_then(|r| {
+                let alpha = r.decode()?;
+                Some(RasterPlane { width: r.width, height: r.height, alpha })
+            });
+            let pts = if raster.is_some() {
+                Vec::new()
+            } else {
+                let path = m.path_at(t);
+                path.flatten(FLATTEN_TOLERANCE / s.max(1e-6)).into_iter().map(|p| [(p.x * s) as f32, (p.y * s) as f32]).collect()
+            };
             FlatMask {
                 pts,
+                raster,
                 feather: (m.feather.f64_at(t).max(0.0) * s) as f32,
                 expansion: (m.expansion.f64_at(t) * s) as f32,
                 opacity: (m.opacity.f64_at(t) / 100.0).clamp(0.0, 1.0) as f32,
@@ -87,9 +133,22 @@ fn seg_dist2(px: f32, py: f32, a: [f32; 2], b: [f32; 2]) -> f32 {
     ex * ex + ey * ey
 }
 
-/// Coverage of one mask for row `y` into `out` (length = width). Reference per-row algorithm:
-/// winding from the row's sorted edge crossings, distance only against edges within the band.
-fn mask_row(m: &FlatMask, y: usize, out: &mut [f32]) {
+/// Coverage of one mask for row `y` of an `out.len()`×`h` image into `out`. A soft raster mask is
+/// sampled by normalized position; a polygon mask uses the winding from the row's sorted edge
+/// crossings and distance only against edges within the band (the reference per-row algorithm).
+fn mask_row(m: &FlatMask, y: usize, h: usize, out: &mut [f32]) {
+    // Soft coverage raster: sample the plane, honouring opacity/inversion (the plane is already
+    // soft, so feather and expansion do not apply). Runs before the polygon path.
+    if let Some(r) = &m.raster {
+        let inv_w = if out.is_empty() { 0.0 } else { 1.0 / out.len() as f32 };
+        let v = if h == 0 { 0.0 } else { (y as f32 + 0.5) / h as f32 };
+        for (x, o) in out.iter_mut().enumerate() {
+            let u = (x as f32 + 0.5) * inv_w;
+            let c = raster_sample(r, u, v);
+            *o = m.opacity * if m.inverted { 1.0 - c } else { c };
+        }
+        return;
+    }
     let n = m.pts.len();
     let py = y as f32 + 0.5;
     let b = band(m);
@@ -150,7 +209,7 @@ pub fn coverage(masks: &[FlatMask], w: usize, h: usize) -> Option<Vec<f32>> {
     acc.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
         let mut tmp = vec![0.0f32; w];
         for m in masks.iter().filter(|m| m.mode != MaskMode::None) {
-            mask_row(m, y, &mut tmp);
+            mask_row(m, y, h, &mut tmp);
             for (a, v) in row.iter_mut().zip(&tmp) {
                 *a = m.mode.combine(*a, *v).clamp(0.0, 1.0);
             }
@@ -208,12 +267,21 @@ pub fn apply_opacity_masks(img: &mut Image, item: &filmcraft_project::TrackItem,
     }
 }
 
-/// Brute-force coverage of one pixel (every edge; the definition the row algorithm and the WGSL
-/// shader implement). For tests and documentation.
-pub fn coverage_at(masks: &[FlatMask], x: f32, y: f32) -> Option<f32> {
+/// Brute-force coverage of one pixel centre (every edge; the definition the row algorithm and the
+/// WGSL shader implement). A soft raster mask is sampled by normalized position from an `w`×`h`
+/// image. For tests and documentation.
+pub fn coverage_at(masks: &[FlatMask], x: f32, y: f32, w: usize, h: usize) -> Option<f32> {
     let first = masks.iter().find(|m| m.mode != MaskMode::None)?;
     let mut acc = first.mode.start();
     for m in masks.iter().filter(|m| m.mode != MaskMode::None) {
+        if let Some(r) = &m.raster {
+            let u = if w == 0 { 0.0 } else { x / w as f32 };
+            let v = if h == 0 { 0.0 } else { y / h as f32 };
+            let c = raster_sample(r, u, v);
+            let val = m.opacity * if m.inverted { 1.0 - c } else { c };
+            acc = m.mode.combine(acc, val).clamp(0.0, 1.0);
+            continue;
+        }
         let n = m.pts.len();
         let mut wind = 0;
         let mut d2 = f32::INFINITY;
@@ -317,9 +385,30 @@ mod tests {
         let c = coverage(&flat, w, h).unwrap();
         for y in 0..h {
             for x in 0..w {
-                let r = coverage_at(&flat, x as f32 + 0.5, y as f32 + 0.5).unwrap();
+                let r = coverage_at(&flat, x as f32 + 0.5, y as f32 + 0.5, w, h).unwrap();
                 assert!((r - c[y * w + x]).abs() < 1e-5, "({x},{y}) {r} vs {}", c[y * w + x]);
             }
         }
+    }
+
+    #[test]
+    fn soft_raster_mask_covers_by_normalized_position() {
+        // a 4×4 plane, opaque on the left column, transparent elsewhere
+        let mut alpha = vec![0u8; 16];
+        for y in 0..4 {
+            alpha[y * 4] = 255;
+        }
+        let raster = filmcraft_project::MaskRaster::from_alpha(4, 4, &alpha).unwrap();
+        let m = Mask::from_raster("Object (1)", raster);
+        let c = effect_coverage(&[m], Tick(0), 1.0, 8, 4).unwrap();
+        // the left \(1/4\) of the plane is set: pixel 0 (u≈0.06) is 1, pixel 7 (u≈0.94) is 0
+        assert!(c[0] > 0.99, "{}", c[0]);
+        assert!(c[7] < 0.01, "{}", c[7]);
+        assert!(c[1] > c[2], "coverage falls with x");
+        // inverting complements it
+        let mut inv = Mask::from_raster("Object (1)", filmcraft_project::MaskRaster::from_alpha(4, 4, &alpha).unwrap());
+        inv.inverted = true;
+        let ci = effect_coverage(&[inv], Tick(0), 1.0, 8, 4).unwrap();
+        assert!((ci[0] + c[0] - 1.0).abs() < 1e-5);
     }
 }

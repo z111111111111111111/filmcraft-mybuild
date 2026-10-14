@@ -11,8 +11,9 @@
 //! key folds a continuous drag into one step).
 
 use filmcraft_geom::{Affine, Vec2};
-use filmcraft_project::{ClipId, EffectInstance, Mask, MaskMode, MaskPath, MaskVertex, ParamValue, TrackKind, TrackMethod};
+use filmcraft_project::{ClipId, EffectInstance, Mask, MaskMode, MaskPath, MaskRaster, MaskVertex, ParamValue, TrackKind, TrackMethod};
 use filmcraft_time::Tick;
+use filmcraft_segment_ml as seg;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::sync::{Arc, Mutex};
@@ -46,13 +47,13 @@ pub(crate) fn commands() -> Vec<CommandSpec> {
         spec(
             "masks.selectObject",
             "Select Object",
-            r#"{"clip":id?,"effect":index|id?="opacity","point":[x,y]? (clip pixels: grow from here),"box":[x,y,w,h]? (clip pixels: leave background margin around the object; the background is cut from its border),"tolerance":0..100?=25 (colour leeway),"feather":px?=0,"preview":bool?=false (outline only: no mask, no track),"track":"forward"|"backward"? (track the new mask right away)}"#,
+            r#"{"clip":id?,"effect":index|id?="opacity","point":[x,y]? (clip pixels: grow from here),"box":[x,y,w,h]? (clip pixels: leave background margin around the object; the background is cut from its border),"tolerance":0..100?=25 (colour leeway),"feather":px?=0,"engine":"auto"|"ml"|"classic"?=auto (AI model when installed),"preview":bool?=false (outline only: no mask, no track),"track":"forward"|"backward"? (track the new mask right away)}"#,
             |s, p| select_subject(s, p, false),
         ),
         spec(
             "masks.selectHuman",
             "Select Human",
-            r#"{"clip":id?,"effect":index|id?="opacity","box":[x,y,w,h]? (clip pixels: drag around the person),"point":[x,y]? (clip pixels; one of `box`/`point` is required),"tolerance":0..100?=25,"feather":px?=2,"preview":bool?=false,"track":"forward"|"backward"|"none"?="forward" (the mask follows the person)}"#,
+            r#"{"clip":id?,"effect":index|id?="opacity","box":[x,y,w,h]? (clip pixels: drag around the person),"point":[x,y]? (clip pixels; one of `box`/`point` is required),"tolerance":0..100?=25,"feather":px?=2,"engine":"auto"|"ml"|"classic"?=auto (AI model when installed),"preview":bool?=false,"track":"forward"|"backward"|"none"?="forward" (the mask follows the person)}"#,
             |s, p| select_subject(s, p, true),
         ),
         spec(
@@ -96,6 +97,26 @@ pub(crate) fn commands() -> Vec<CommandSpec> {
             params: r#"{"clip":id?,"time":ticks?}"#,
             enabled: has_seq,
             run: list,
+            journal: false,
+        },
+        CommandSpec {
+            id: "masks.models",
+            label: "Segmentation Models",
+            menu: &[],
+            shortcut: None,
+            params: r#"{}"#,
+            enabled: crate::commands::always,
+            run: list_models,
+            journal: false,
+        },
+        CommandSpec {
+            id: "masks.downloadModel",
+            label: "Download Segmentation Model",
+            menu: &[],
+            shortcut: None,
+            params: r#"{"subject":"object"|"human"|"sam2-small"|"birefnet-hr-matting"?="object","wait":bool?}"#,
+            enabled: crate::commands::always,
+            run: download_model,
             journal: false,
         },
     ]
@@ -311,6 +332,162 @@ enum Seed {
     Box(f64, f64, f64, f64),
 }
 
+/// Which segmenter `masks.selectObject` / `masks.selectHuman` use.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SegEngine {
+    /// The AI model when it is installed, else the classical tools.
+    Auto,
+    /// Force the AI model (error when unavailable).
+    Ml,
+    /// Force the classical grow-from-seed tools.
+    Classic,
+}
+
+/// The models directory when `subject`'s model is installed and this build can run it.
+fn ml_model_dir(human: bool) -> Option<std::path::PathBuf> {
+    if !seg::available() {
+        return None;
+    }
+    let subject = if human { seg::Subject::Human } else { seg::Subject::Object };
+    let dir = crate::transcript::models_dir()?;
+    let m = seg::catalogue::for_subject(subject)?;
+    seg::catalogue::installed(&dir, m).then_some(dir)
+}
+
+/// Whether the AI segmenter is ready for this subject (feature on and model installed).
+fn ml_ready(human: bool) -> bool {
+    ml_model_dir(human).is_some()
+}
+
+/// A human-readable reason for a segmentation failure.
+fn ml_err(e: &seg::SegmentError) -> String {
+    match e {
+        seg::SegmentError::NotInstalled(_) => "the AI model is not downloaded (see masks.models / masks.downloadModel)".into(),
+        seg::SegmentError::Cancelled => "stopped".into(),
+        other => other.to_string(),
+    }
+}
+
+/// The bounding box of the matte's covered pixels (alpha ≥ 128), or `None` when it is empty.
+fn matte_bbox(m: &seg::Matte) -> Option<(u32, u32, u32, u32)> {
+    let (w, h) = (m.width(), m.height());
+    let (mut x0, mut y0, mut x1, mut y1) = (u32::MAX, u32::MAX, 0u32, 0u32);
+    let mut any = false;
+    for y in 0..h {
+        for x in 0..w {
+            if m.at(x, y).unwrap_or(0) >= 128 {
+                any = true;
+                x0 = x0.min(x);
+                y0 = y0.min(y);
+                x1 = x1.max(x);
+                y1 = y1.max(y);
+            }
+        }
+    }
+    any.then_some((x0, y0, x1, y1))
+}
+
+/// Segment with an AI model (SAM 2 for an object, BiRefNet HR Matting for a person) and store the
+/// soft matte as a raster mask (schema v17). Runs on the CPU; the model is on disk already.
+///
+/// A `preview` shows the seed and defers running the model to the confirming call, so a click never
+/// runs the model twice. AI masks are computed per frame, so no tracking is applied (the classic
+/// tools track; a soft matte is re-segmented per frame instead).
+fn select_ml(
+    s: &mut Session,
+    p: &Value,
+    cmd: &str,
+    human: bool,
+    clip: ClipId,
+    rgba: &[u8],
+    fw: usize,
+    fh: usize,
+    sw: f64,
+    sh: f64,
+    seed: &Seed,
+    track_dir: Option<String>,
+) -> Result<Value> {
+    let subject = if human { seg::Subject::Human } else { seg::Subject::Object };
+    let dir = ml_model_dir(human).ok_or_else(|| bad(cmd, "the AI model is not downloaded (see masks.downloadModel)"))?;
+    // clip pixels → frame pixels
+    let (kx, ky) = (sw / fw as f64, sh / fh as f64);
+    let to_frame = |x: f64, y: f64| (x / kx, y / ky);
+    if p.get("preview").and_then(Value::as_bool).unwrap_or(false) {
+        // show the seed as the outline without running the model
+        let (x0, y0, x1, y1) = match seed {
+            Seed::Point(q) => (q.x - 4.0, q.y - 4.0, q.x + 4.0, q.y + 4.0),
+            Seed::Box(x, y, w, h) => (*x, *y, x + w, y + h),
+        };
+        return Ok(json!({
+            "engine": "ml",
+            "deferred": true,
+            "outline": [[x0, y0], [x1, y0], [x1, y1], [x0, y1]],
+            "bbox": [x0, y0, x1, y1],
+        }));
+    }
+    let prompt = match seed {
+        Seed::Point(q) => {
+            let (fx, fy) = to_frame(q.x, q.y);
+            seg::Prompt::click(fx as f32, fy as f32)
+        }
+        Seed::Box(x, y, w, h) => {
+            let (x0, y0) = to_frame(*x, *y);
+            let (x1, y1) = to_frame(x + w, y + h);
+            seg::Prompt { points: Vec::new(), box_rect: Some(seg::FrameBox { x0: x0 as f32, y0: y0 as f32, x1: x1 as f32, y1: y1 as f32 }) }
+        }
+    };
+    let img = seg::Rgba { width: fw as u32, height: fh as u32, data: rgba };
+    let opts = seg::Options { resolution: 1024, smooth_temporal: false };
+    let matte = seg::segment(subject, &img, &prompt, &opts, &dir, &mut |_, _| true).map_err(|e| bad(cmd, ml_err(&e)))?;
+    let (bx0, by0, bx1, by1) = matte_bbox(&matte).ok_or_else(|| bad(cmd, "the model found nothing to select: try a tighter box or a click inside the object"))?;
+    let raster = MaskRaster { width: matte.width(), height: matte.height(), rle: matte.rle_encode() };
+    // frame pixels → clip pixels for the reported bounds
+    let (cx0, cy0) = (bx0 as f64 * kx, by0 as f64 * ky);
+    let (cx1, cy1) = (bx1 as f64 * kx, by1 as f64 * ky);
+    let eff = p.get("effect").cloned();
+    let prefix = if human { "Human" } else { "Object" };
+    let label = if human { "Select Human" } else { "Select Object" };
+    let (ei, mi, name) = push_raster_mask(s, clip, eff, prefix, raster, label)?;
+    Ok(json!({
+        "clip": clip.0, "effect": ei, "mask": mi, "name": name,
+        "engine": "ml", "vertices": 0,
+        "bbox": [cx0, cy0, cx1, cy1],
+        "outline": [[cx0, cy0], [cx1, cy0], [cx1, cy1], [cx0, cy1]],
+        "track": Value::Null,
+        "note": track_dir.map(|_| "AI masks are computed per frame; tracking is not applied"),
+    }))
+}
+
+/// Push a soft raster mask like [`push_mask`] does, with a caller-chosen name prefix.
+fn push_raster_mask(s: &mut Session, clip: ClipId, eff: Option<Value>, prefix: &str, raster: MaskRaster, label: &str) -> Result<(usize, usize, String)> {
+    let seq_id = s.state.active_sequence.ok_or(EngineError::NoSequence)?;
+    s.edit(label, move |pr, st| {
+        let q = pr.sequence_mut(seq_id).ok_or(EngineError::NoSequence)?;
+        let (_, it) = q.find_item_mut(clip).ok_or(filmcraft_edit::EditError::NoItem(clip))?;
+        let ei = effect_index(&it.effects, eff.as_ref(), None, clip).ok_or_else(|| bad(label, "no such effect on clip"))?;
+        let e = &mut it.effects[ei];
+        if e.def().is_none_or(|d| d.kind != filmcraft_project::EffectKind::Video) {
+            return Err(bad(label, "masks apply to video effects"));
+        }
+        if e.effect == "motion" {
+            return Err(bad(label, "Motion has no masks"));
+        }
+        let n = e
+            .masks
+            .iter()
+            .filter_map(|m| m.name.strip_prefix(prefix).and_then(|r| r.strip_prefix(" (")?.strip_suffix(')')?.parse::<usize>().ok()).or_else(|| (m.name == prefix).then_some(0)))
+            .max()
+            .unwrap_or(0)
+            + 1;
+        let name = format!("{prefix} ({n})");
+        e.masks.push(Mask::from_raster(name.clone(), raster));
+        let mi = e.masks.len() - 1;
+        st.selected_mask = Some(MaskSel { clip, effect: ei, mask: mi });
+        st.selected_effect = None;
+        Ok((ei, mi, name))
+    })
+}
+
 /// Select an object (or a person) as an editable vector mask: grow the seed into its region,
 /// trace and simplify the boundary, add the mask, and optionally track it right away.
 ///
@@ -372,6 +549,19 @@ fn select_subject(s: &mut Session, p: &Value, human: bool) -> Result<Value> {
             }
         },
     };
+    // which engine: the AI model when installed (`auto`), or the classical grow-from-seed tools
+    let engine = match str_p(p, "engine") {
+        Some(e) => match e.to_ascii_lowercase().as_str() {
+            "auto" => SegEngine::Auto,
+            "ml" | "ai" => SegEngine::Ml,
+            "classic" => SegEngine::Classic,
+            other => return Err(bad(cmd, format!("`engine`: auto, ml or classic (got `{other}`)"))),
+        },
+        None => SegEngine::Auto,
+    };
+    if engine == SegEngine::Ml && !seg::available() {
+        return Err(bad(cmd, "AI segmentation is not available in this build (built without the `segment` feature)"));
+    }
     // decode at working size; flood fill is linear in pixels
     let scale = (SELECT_MAX_WIDTH / sw.max(sh)).min(1.0) as f32;
     let src = s.source(it.item).ok_or_else(|| bad(cmd, "the clip has no media to select from"))?;
@@ -381,6 +571,10 @@ fn select_subject(s: &mut Session, p: &Value, human: bool) -> Result<Value> {
         return Err(bad(cmd, "can't decode the frame at the playhead"));
     }
     let rgba = fr.to_rgba8();
+    // AI path: when the model is installed, use it (`auto`) unless the caller asked for `classic`
+    if engine != SegEngine::Classic && ml_ready(human) {
+        return select_ml(s, p, cmd, human, clip, &rgba, fw, fh, sw, sh, &seed_box, track_dir);
+    }
     // frame pixels → clip pixels
     let (kx, ky) = (sw / fw as f64, sh / fh as f64);
     let to_clip = |poly: Vec<(f64, f64)>| poly.into_iter().map(|(x, y)| (x * kx, y * ky)).collect::<Vec<_>>();
@@ -745,6 +939,7 @@ fn list(s: &mut Session, p: &Value) -> Result<Value> {
                         "feather": m.feather.f64_at(mt),
                         "opacity": m.opacity.f64_at(mt),
                         "expansion": m.expansion.f64_at(mt),
+                        "raster": m.raster.as_ref().map(|r| json!({"width": r.width, "height": r.height})),
                         "path": path_to_json(&m.path_at(mt)),
                         "pathKeyframes": m.path.keyframes.iter().map(|k| k.time.0).collect::<Vec<_>>(),
                         "selected": s.state.selected_mask == Some(MaskSel { clip: it.id, effect: ei, mask: mi }),
@@ -754,6 +949,127 @@ fn list(s: &mut Session, p: &Value) -> Result<Value> {
         }
     }
     Ok(json!({"masks": out}))
+}
+
+/// The segmentation models: what they are, whether this build can run them, and if they are
+/// installed (so a UI can offer to download the missing ones).
+fn list_models(_s: &mut Session, _p: &Value) -> Result<Value> {
+    let dir = crate::transcript::models_dir();
+    let models: Vec<Value> = seg::catalogue::catalogue()
+        .iter()
+        .map(|m| {
+            json!({
+                "id": m.id,
+                "name": m.name,
+                "subject": m.subject,
+                "description": m.description,
+                "license": m.license,
+                "licenseUrl": m.license_url,
+                "author": m.author,
+                "source": m.source,
+                "size": m.size(),
+                "installed": dir.as_deref().is_some_and(|d| seg::catalogue::installed(d, m)),
+            })
+        })
+        .collect();
+    Ok(json!({"available": seg::available(), "models": models}))
+}
+
+/// Download a segmentation model (object: SAM 2 small; human: BiRefNet HR Matting), SHA-256 and
+/// size checked before it is used. Needs the `segment-download` feature.
+fn download_model(s: &mut Session, p: &Value) -> Result<Value> {
+    let cmd = "masks.downloadModel";
+    let key = str_p(p, "subject").unwrap_or("object").to_ascii_lowercase();
+    let m = match key.as_str() {
+        "object" | "sam2" => seg::catalogue::for_subject(seg::Subject::Object),
+        "human" | "person" | "birefnet" => seg::catalogue::for_subject(seg::Subject::Human),
+        id => seg::catalogue::find(id),
+    }
+    .ok_or_else(|| bad(cmd, format!("unknown model `{key}` (object, human, sam2-small or birefnet-hr-matting)")))?;
+    let dir = crate::transcript::models_dir().ok_or_else(|| bad(cmd, "no data directory for segmentation models"))?;
+    #[cfg(not(feature = "segment-download"))]
+    {
+        let _ = (s, p, &dir, m);
+        return Err(bad(cmd, "model downloads are not available in this build (built without the `segment-download` feature)"));
+    }
+    #[cfg(feature = "segment-download")]
+    {
+        if seg::catalogue::installed(&dir, m) {
+            return Ok(json!({"model": m.id, "installed": true, "job": null}));
+        }
+        let wait = p.get("wait").and_then(Value::as_bool).unwrap_or(false);
+        let job = new_job(s, format!("Downloading {}", m.name));
+        job.progress.total.store(seg::catalogue::missing_bytes(&dir, m), std::sync::atomic::Ordering::Relaxed);
+        let (prog, res, dirc, mc) = (job.progress.clone(), job.result.clone(), dir.clone(), m);
+        let id = spawn(s, job, wait, "filmcraft-seg-download", move || {
+            let t0 = web_time::Instant::now();
+            let r = download_package_seg(&dirc, mc, &prog);
+            finish_job(&prog, &res, r.map(|()| format!("{} installed", mc.name)), t0);
+        })?;
+        Ok(json!({"model": m.id, "installed": false, "job": id}))
+    }
+}
+
+#[cfg(feature = "segment-download")]
+fn download_package_seg(dir: &std::path::Path, m: &'static seg::catalogue::ModelInfo, prog: &filmcraft_export::Progress) -> std::result::Result<(), String> {
+    use std::sync::atomic::Ordering;
+    let mut progress = |done: u64, total: u64, file: &str| {
+        prog.done.store(done, Ordering::Relaxed);
+        prog.total.store(total, Ordering::Relaxed);
+        *prog.status.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = format!("Downloading {file}");
+        !prog.cancel.load(Ordering::Relaxed)
+    };
+    seg::catalogue::download(dir, m, &mut progress).map_err(|e| e.to_string())
+}
+
+#[cfg(feature = "segment-download")]
+fn download_model_inner(cmd: &str, dir: &std::path::Path, m: &'static seg::catalogue::ModelInfo) -> Result<Value> {
+    if seg::catalogue::installed(dir, m) {
+        return Ok(json!({"model": m.id, "installed": true}));
+    }
+    seg::catalogue::download(dir, m, &mut |_, _, _| true).map_err(|e| bad(cmd, e.to_string()))?;
+    Ok(json!({"model": m.id, "installed": true, "dir": seg::catalogue::model_dir(dir, m).to_string_lossy()}))
+}
+
+#[cfg(not(feature = "segment-download"))]
+fn download_model_inner(cmd: &str, _dir: &std::path::Path, _m: &'static seg::catalogue::ModelInfo) -> Result<Value> {
+    Err(bad(cmd, "model downloads are not available in this build (built without the `segment-download` feature)"))
+}
+
+fn new_job(s: &mut Session, label: String) -> crate::Job {
+    let id = s.jobs.iter().map(|j| j.id).max().unwrap_or(0) + 1;
+    crate::Job { id, label, progress: Default::default(), result: Default::default() }
+}
+
+fn spawn(s: &mut Session, job: crate::Job, wait: bool, name: &str, run: impl FnOnce() + Send + 'static) -> Result<u64> {
+    let id = job.id;
+    let run = crate::export_tools::guard_job(job.progress.clone(), job.result.clone(), run);
+    s.jobs.push(job);
+    if wait || cfg!(target_arch = "wasm32") {
+        run();
+    } else {
+        std::thread::Builder::new().name(name.into()).spawn(run).map_err(|e| EngineError::Other(e.to_string()))?;
+    }
+    Ok(id)
+}
+
+fn finish_job(prog: &filmcraft_export::Progress, res: &std::sync::Mutex<Option<std::result::Result<filmcraft_export::Report, String>>>, r: std::result::Result<String, String>, t0: web_time::Instant) {
+    use std::sync::atomic::Ordering;
+    use std::sync::PoisonError;
+    let secs = t0.elapsed().as_secs_f64();
+    let r = match r {
+        Ok(status) => {
+            *prog.status.lock().unwrap_or_else(PoisonError::into_inner) = status;
+            Ok(filmcraft_export::Report { path: String::new(), frames: 0, seconds: secs, bytes: 0, render_fps: 0.0, extra_files: Vec::new() })
+        }
+        Err(e) => {
+            *prog.status.lock().unwrap_or_else(PoisonError::into_inner) = e.clone();
+            *prog.error.lock().unwrap_or_else(PoisonError::into_inner) = Some(e.clone());
+            Err(e)
+        }
+    };
+    prog.finished.store(true, Ordering::Relaxed);
+    *res.lock().unwrap_or_else(PoisonError::into_inner) = Some(r);
 }
 
 /// The parameter a keyframe / setParam command addresses: a mask parameter when `mask` is given.
@@ -794,6 +1110,9 @@ fn track(s: &mut Session, p: &Value) -> Result<Value> {
         .or(sel.filter(|x| x.clip == clip && x.effect == ei).map(|x| x.mask))
         .ok_or_else(|| bad("masks.track", "need `mask`"))?;
     let mask = it.effects[ei].masks.get(mi).cloned().ok_or_else(|| bad("masks.track", format!("no mask {mi}")))?;
+    if mask.is_raster() {
+        return Err(bad("masks.track", "this is an AI (soft) mask, computed per frame: it cannot be tracked; run Object/Human Select on the frame instead"));
+    }
     if s.mask_jobs.iter().any(|j| j.target.clip == clip && j.target.effect == ei && j.target.mask == mi) {
         return Err(bad("masks.track", "this mask is already being tracked"));
     }
