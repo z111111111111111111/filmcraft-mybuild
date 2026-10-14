@@ -546,12 +546,20 @@ fn draw_field(app: &mut FilmcraftApp, ui: &mut Ui, d: &mut SettingsDraft, f: &Fi
                         put(&mut d.values, f.key, json!(v));
                     }
                 }
-                Kind::Text | Kind::Font | Kind::Path => {
+                Kind::Font => {
+                    field_label(ui, f.label);
+                    let cur_s = choice_text(&cur);
+                    let (picked, r) = crate::panels::font_picker::show(app, ui, f.key, &cur_s, 220.0, &format!("settings.{}", f.key));
+                    app.auto.add(&format!("settings.{}", f.key), r.rect, f.label);
+                    if let Some(v) = picked {
+                        put(&mut d.values, f.key, json!(v));
+                    }
+                }
+                Kind::Text | Kind::Path => {
                     field_label(ui, f.label);
                     let mut s = choice_text(&cur);
                     let hint = match f.kind {
                         Kind::Path => tl!("Default location"),
-                        Kind::Font => tl!("Font family"),
                         _ => "",
                     };
                     let r = ui.add(egui::TextEdit::singleline(&mut s).desired_width(if matches!(f.kind, Kind::Path) { 300.0 } else { 220.0 }).hint_text(hint));

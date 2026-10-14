@@ -1657,17 +1657,11 @@ pub fn properties(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
             };
             let fams = filmcraft_text::families();
             let (_, mut vui) = cx.row(ui, tl!("Font"));
-            let r = egui::ComboBox::from_id_salt(("gfx-font", clip.0, l)).selected_text(&family).width(170.0).height(400.0).show_ui(&mut vui, |ui| {
-                if !filmcraft_text::fonts::system_scanned() {
-                    filmcraft_text::fonts::scan_system();
-                }
-                for (f, _) in &fams {
-                    if ui.selectable_label(*f == family, f).clicked() {
-                        cx.set("font", json!(f));
-                    }
-                }
-            });
-            cx.auto("font", r.response.rect, "Font");
+            let (picked, r) = crate::panels::font_picker::show(app, &mut vui, &format!("gfx-font-{}-{l}", clip.0), &family, 170.0, "graphics.font");
+            cx.auto("font", r.rect, "Font");
+            if let Some(f) = picked {
+                cx.set("font", json!(f));
+            }
             let styles: Vec<String> = fams.iter().find(|(f, _)| f.eq_ignore_ascii_case(&family)).map(|(_, s)| s.clone()).unwrap_or_default();
             let (_, mut vui) = cx.row(ui, tl!("Font Style"));
             let r = egui::ComboBox::from_id_salt(("gfx-style", clip.0, l)).selected_text(&style).width(170.0).show_ui(&mut vui, |ui| {

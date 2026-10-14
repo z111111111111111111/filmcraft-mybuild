@@ -31,61 +31,13 @@ pub const MAX_WORK_SIDE: usize = 1440;
 pub const MAX_VERTICES: usize = 512;
 /// Regions below this many pixels are specks, not objects.
 pub const MIN_AREA: usize = 16;
+/// A region covering more than this share of the picture leaked into the background.
+pub const MAX_COVERAGE: f64 = 0.95;
 
 /// Grow the seed's region: the 8-connected set of pixels whose every channel stays within
 /// `tolerance` of the seed (L∞ in RGB, alpha ignored). Returns the bitmask (1 = selected).
 pub fn grow_region(rgba: &[u8], w: usize, h: usize, seed: (u32, u32), tolerance: u8) -> Result<Vec<u8>, SegmentError> {
-    if w == 0 || h == 0 || rgba.len() != w.saturating_mul(h).saturating_mul(4) {
-        return Err(SegmentError::InvalidInput);
-    }
-    let (sx, sy) = (seed.0 as usize, seed.1 as usize);
-    if sx >= w || sy >= h {
-        return Err(SegmentError::SeedOutside);
-    }
-    let at = |x: usize, y: usize| -> Option<[u8; 3]> {
-        let i = y.checked_mul(w)?.checked_add(x)?.checked_mul(4)?;
-        let px = rgba.get(i..i.checked_add(3)?)?;
-        Some([px.get(0).copied().unwrap_or(0), px.get(1).copied().unwrap_or(0), px.get(2).copied().unwrap_or(0)])
-    };
-    let seed_px = at(sx, sy).ok_or(SegmentError::SeedOutside)?;
-    let tol = tolerance as i16;
-    let mut mask = vec![0u8; w.saturating_mul(h)];
-    let mut stack = vec![sy.saturating_mul(w).saturating_add(sx)];
-    let mut area = 0usize;
-    while let Some(i) = stack.pop() {
-        let (x, y) = (i % w, i / w);
-        if mask.get(i).is_none_or(|m| *m != 0) {
-            continue;
-        }
-        let Some(px) = at(x, y) else { continue };
-        let close = (px[0] as i16 - seed_px[0] as i16).abs().max((px[1] as i16 - seed_px[1] as i16).abs()).max((px[2] as i16 - seed_px[2] as i16).abs()) <= tol;
-        if !close {
-            continue;
-        }
-        if let Some(m) = mask.get_mut(i) {
-            *m = 1;
-        }
-        area = area.saturating_add(1);
-        for dy in -1i32..=1 {
-            for dx in -1i32..=1 {
-                if dx == 0 && dy == 0 {
-                    continue;
-                }
-                let (nx, ny) = (x as i32 + dx, y as i32 + dy);
-                if nx >= 0 && ny >= 0 {
-                    if let (Some(nx), Some(ny)) = (usize::try_from(nx).ok(), usize::try_from(ny).ok()) {
-                        if nx < w && ny < h {
-                            stack.push(ny.saturating_mul(w).saturating_add(nx));
-                        }
-                    }
-                }
-            }
-        }
-    }
-    if area < MIN_AREA {
-        return Err(SegmentError::NothingFound);
-    }
-    Ok(mask)
+    grow_multi(rgba, w, h, std::slice::from_ref(&seed), tolerance)
 }
 
 /// Trace every boundary loop of the bitmask with marching squares on a zero-padded grid.
@@ -226,12 +178,131 @@ fn bbox(mask: &[u8], w: usize, h: usize) -> Option<(f64, f64, f64, f64)> {
     (x1 > x0 && y1 > y0).then_some((x0, y0, x1, y1))
 }
 
-/// The seed's object as a polygon in picture pixels: grow, trace the longest boundary loop,
-/// simplify to mask-friendly vertices (corner points). Falls back to the region's bounding box
-/// when the boundary degenerates; errors stay actionable.
-pub fn object_polygon(rgba: &[u8], w: usize, h: usize, seed: (u32, u32), tolerance: u8) -> Result<Vec<(f64, f64)>, SegmentError> {
-    let mask = grow_region(rgba, w, h, seed, tolerance)?;
-    let mut loops = trace_loops(&mask, w, h);
+/// Keep only the largest 8-connected component of the bitmask: after a box-background cut
+/// the foreground may be islands, and the object is the biggest one. Every pixel is visited
+/// once, so this stays linear.
+pub fn largest_component(mask: &[u8], w: usize, h: usize) -> Vec<u8> {
+    let n = w.saturating_mul(h);
+    if w == 0 || h == 0 || mask.len() != n {
+        return Vec::new();
+    }
+    let mut label = vec![0u32; n];
+    let mut stack = Vec::new();
+    let (mut best_label, mut best_size) = (0u32, 0usize);
+    let mut next = 1u32;
+    for s in 0..n {
+        if mask.get(s).is_none_or(|m| *m == 0) || label.get(s).is_some_and(|l| *l != 0) {
+            continue;
+        }
+        stack.clear();
+        stack.push(s);
+        if let Some(slot) = label.get_mut(s) {
+            *slot = next;
+        }
+        let mut size = 0usize;
+        while let Some(i) = stack.pop() {
+            size = size.saturating_add(1);
+            let (x, y) = (i % w, i / w);
+            for dy in -1i32..=1 {
+                for dx in -1i32..=1 {
+                    if dx == 0 && dy == 0 {
+                        continue;
+                    }
+                    let (nx, ny) = (x as i32 + dx, y as i32 + dy);
+                    if nx < 0 || ny < 0 {
+                        continue;
+                    }
+                    let j = (ny as usize).saturating_mul(w).saturating_add(nx as usize);
+                    if j >= n || mask.get(j).is_none_or(|m| *m == 0) || label.get(j).is_some_and(|l| *l != 0) {
+                        continue;
+                    }
+                    if let Some(slot) = label.get_mut(j) {
+                        *slot = next;
+                    }
+                    stack.push(j);
+                }
+            }
+        }
+        if size > best_size {
+            best_size = size;
+            best_label = next;
+        }
+        next = next.saturating_add(1);
+    }
+    if best_label == 0 {
+        return vec![0u8; n];
+    }
+    label.iter().map(|l| u8::from(*l == best_label)).collect()
+}
+
+/// Grow from any of `seeds` (shared visited set): one call floods a whole seed list, e.g.
+/// every border pixel of a box.
+pub fn grow_multi(rgba: &[u8], w: usize, h: usize, seeds: &[(u32, u32)], tolerance: u8) -> Result<Vec<u8>, SegmentError> {
+    if w == 0 || h == 0 || rgba.len() != w.saturating_mul(h).saturating_mul(4) {
+        return Err(SegmentError::InvalidInput);
+    }
+    let at = |x: usize, y: usize| -> Option<[u8; 3]> {
+        let i = y.checked_mul(w)?.checked_add(x)?.checked_mul(4)?;
+        let px = rgba.get(i..i.checked_add(3)?)?;
+        Some([px.get(0).copied().unwrap_or(0), px.get(1).copied().unwrap_or(0), px.get(2).copied().unwrap_or(0)])
+    };
+    // every seed must read a colour: seeds outside are skipped, none inside is an error
+    let colours: Vec<[u8; 3]> = seeds.iter().filter_map(|(sx, sy)| at(*sx as usize, *sy as usize)).collect();
+    if colours.is_empty() {
+        return Err(SegmentError::SeedOutside);
+    }
+    let tol = tolerance as i16;
+    let mut mask = vec![0u8; w.saturating_mul(h)];
+    let mut stack = Vec::new();
+    for (sx, sy) in seeds {
+        let (sx, sy) = (*sx as usize, *sy as usize);
+        if sx < w && sy < h {
+            stack.push(sy.saturating_mul(w).saturating_add(sx));
+        }
+    }
+    let mut area = 0usize;
+    while let Some(i) = stack.pop() {
+        let (x, y) = (i % w, i / w);
+        if mask.get(i).is_none_or(|m| *m != 0) {
+            continue;
+        }
+        let Some(px) = at(x, y) else { continue };
+        let close = colours.iter().any(|s| {
+            (px[0] as i16 - s[0] as i16).abs().max((px[1] as i16 - s[1] as i16).abs()).max((px[2] as i16 - s[2] as i16).abs()) <= tol
+        });
+        if !close {
+            continue;
+        }
+        if let Some(m) = mask.get_mut(i) {
+            *m = 1;
+        }
+        area = area.saturating_add(1);
+        for dy in -1i32..=1 {
+            for dx in -1i32..=1 {
+                if dx == 0 && dy == 0 {
+                    continue;
+                }
+                let (nx, ny) = (x as i32 + dx, y as i32 + dy);
+                if nx >= 0 && ny >= 0 {
+                    if let (Some(nx), Some(ny)) = (usize::try_from(nx).ok(), usize::try_from(ny).ok()) {
+                        if nx < w && ny < h {
+                            stack.push(ny.saturating_mul(w).saturating_add(nx));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if area < MIN_AREA {
+        return Err(SegmentError::NothingFound);
+    }
+    Ok(mask)
+}
+
+/// A bitmask as a polygon: longest boundary loop simplified, bounding-box fallback, same as
+/// [`object_polygon`]'s tail. Shared by the point and box pipelines.
+pub fn polygon_from_mask(mask: &[u8], w: usize, h: usize) -> Result<Vec<(f64, f64)>, SegmentError> {
+    let mut loops = trace_loops(mask, w, h);
     loops.sort_by_key(|l| std::cmp::Reverse(l.len()));
     if let Some(outer) = loops.first() {
         let pts: Vec<(f64, f64)> = outer.iter().map(|(x, y)| (*x as f64 / 2.0, *y as f64 / 2.0)).collect();
@@ -245,11 +316,84 @@ pub fn object_polygon(rgba: &[u8], w: usize, h: usize, seed: (u32, u32), toleran
             return Err(SegmentError::TooComplex);
         }
     }
-    // degenerate boundary (a line, a dot row): the region's box still selects the object
-    if let Some((x0, y0, x1, y1)) = bbox(&mask, w, h) {
+    if let Some((x0, y0, x1, y1)) = bbox(mask, w, h) {
         return Ok(vec![(x0, y0), (x1, y0), (x1, y1), (x0, y1)]);
     }
     Err(SegmentError::NothingFound)
+}
+
+/// The object inside `clip_box` (x, y, w, h, picture pixels): flood the box border as
+/// background, keep the interior that is NOT background, trace the largest island. Unlike a
+/// centre seed this handles multicolour objects on complex scenes — the common person case —
+/// because the background, not the object, must match one tolerance.
+pub fn boxed_object_polygon(rgba: &[u8], w: usize, h: usize, clip_box: (u32, u32, u32, u32), tolerance: u8) -> Result<Vec<(f64, f64)>, SegmentError> {
+    if w == 0 || h == 0 || rgba.len() != w.saturating_mul(h).saturating_mul(4) {
+        return Err(SegmentError::InvalidInput);
+    }
+    let (bx, by, bw, bh) = (clip_box.0 as usize, clip_box.1 as usize, clip_box.2 as usize, clip_box.3 as usize);
+    if bw == 0 || bh == 0 || bx >= w || by >= h {
+        return Err(SegmentError::SeedOutside);
+    }
+    let (x1, y1) = (bx.saturating_add(bw).min(w), by.saturating_add(bh).min(h));
+    if x1 <= bx + 1 || y1 <= by + 1 {
+        return Err(SegmentError::NothingFound);
+    }
+    // border pixels seed the background flood — but only the majority colour: a tight box
+    // touches the object, and those pixels must not seed. Colours are bucketed coarsely so
+    // video noise still votes together.
+    let bucket = |px: [u8; 3]| ((px[0] >> 3) as u32, (px[1] >> 3) as u32, (px[2] >> 3) as u32);
+    let border = |x: usize, y: usize| -> Option<[u8; 3]> {
+        let i = y.checked_mul(w)?.checked_add(x)?.checked_mul(4)?;
+        let px = rgba.get(i..i.checked_add(3)?)?;
+        Some([px.get(0).copied().unwrap_or(0), px.get(1).copied().unwrap_or(0), px.get(2).copied().unwrap_or(0)])
+    };
+    use std::collections::HashMap;
+    let mut votes: HashMap<(u32, u32, u32), usize> = HashMap::new();
+    let mut edge: Vec<((u32, u32), [u8; 3])> = Vec::new();
+    for x in bx..x1 {
+        for y in [by, y1 - 1] {
+            if let Some(px) = border(x, y) {
+                *votes.entry(bucket(px)).or_insert(0) += 1;
+                edge.push(((x as u32, y as u32), px));
+            }
+        }
+    }
+    for y in by.saturating_add(1)..y1.saturating_sub(1) {
+        for x in [bx, x1 - 1] {
+            if let Some(px) = border(x, y) {
+                *votes.entry(bucket(px)).or_insert(0) += 1;
+                edge.push(((x as u32, y as u32), px));
+            }
+        }
+    }
+    let bg_bucket = votes.into_iter().max_by_key(|(_, n)| *n).map(|(b, _)| b);
+    let Some(bg_bucket) = bg_bucket else { return Err(SegmentError::NothingFound) };
+    let seeds: Vec<(u32, u32)> = edge.into_iter().filter(|(_, px)| bucket(*px) == bg_bucket).map(|(p, _)| p).collect();
+    let bg = grow_multi(rgba, w, h, &seeds, tolerance)?;
+    let mut fg = vec![0u8; w.saturating_mul(h)];
+    for y in by..y1 {
+        for x in bx..x1 {
+            let i = y.saturating_mul(w).saturating_add(x);
+            if bg.get(i).is_none_or(|b| *b == 0) {
+                if let Some(slot) = fg.get_mut(i) {
+                    *slot = 1;
+                }
+            }
+        }
+    }
+    let fg = largest_component(&fg, w, h);
+    if fg.iter().all(|m| *m == 0) {
+        return Err(SegmentError::NothingFound);
+    }
+    polygon_from_mask(&fg, w, h)
+}
+
+/// The seed's object as a polygon in picture pixels: grow, trace the longest boundary loop,
+/// simplify to mask-friendly vertices (corner points). Falls back to the region's bounding box
+/// when the boundary degenerates; errors stay actionable.
+pub fn object_polygon(rgba: &[u8], w: usize, h: usize, seed: (u32, u32), tolerance: u8) -> Result<Vec<(f64, f64)>, SegmentError> {
+    let mask = grow_region(rgba, w, h, seed, tolerance)?;
+    polygon_from_mask(&mask, w, h)
 }
 
 /// A polygon as an editable mask path (corner vertices; round or smooth them afterwards).
@@ -326,5 +470,57 @@ mod tests {
             slot.copy_from_slice(&[250, 250, 250]);
         }
         assert_eq!(grow_region(&dot, 12, 12, (6, 6), 0), Err(SegmentError::NothingFound));
+    }
+
+    #[test]
+    fn box_cut_keeps_a_multicolour_object() {
+        // red disc + green square on a blue background: no single flood covers both, but the
+        // box border is all background, so the box cut keeps exactly the two shapes' island
+        let px = frame(40, 40, |x, y| {
+            let in_disc = (x as i32 - 13).pow(2) + (y as i32 - 20).pow(2) < 64;
+            let in_sq = (24..32).contains(&x) && (14..26).contains(&y);
+            if in_disc {
+                [200, 40, 40]
+            } else if in_sq {
+                [40, 200, 40]
+            } else {
+                [40, 40, 200]
+            }
+        });
+        let poly = boxed_object_polygon(&px, 40, 40, (4, 8, 32, 24), 10).unwrap();
+        let (mut x0, mut y0, mut x1, mut y1) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
+        for (x, y) in &poly {
+            x0 = x0.min(*x);
+            y0 = y0.min(*y);
+            x1 = x1.max(*x);
+            y1 = y1.max(*y);
+        }
+        // the disc (the bigger island) roughly fills x 6..21, y 13..28
+        assert!(x0 <= 6.0 && y0 <= 13.0 && x1 >= 20.0 && y1 >= 27.0, "{poly:?}");
+        assert!(x1 <= 22.0 && y1 <= 29.0, "the square island is dropped, the disc kept: {poly:?}");
+        // degenerate boxes are errors, not panics
+        assert_eq!(boxed_object_polygon(&px, 40, 40, (0, 0, 0, 10), 10), Err(SegmentError::SeedOutside));
+        assert_eq!(boxed_object_polygon(&px, 40, 40, (99, 99, 5, 5), 10), Err(SegmentError::SeedOutside));
+    }
+
+    #[test]
+    fn largest_component_keeps_the_biggest_island() {
+        // two filled squares, 4×4 and 2×2
+        let mut mask = vec![0u8; 20 * 20];
+        for y in 2..6 {
+            for x in 2..6 {
+                mask[y * 20 + x] = 1;
+            }
+        }
+        for y in 12..14 {
+            for x in 12..14 {
+                mask[y * 20 + x] = 1;
+            }
+        }
+        let kept = largest_component(&mask, 20, 20);
+        assert_eq!(kept.iter().filter(|m| **m != 0).count(), 16);
+        assert_eq!(kept[3 * 20 + 3], 1);
+        assert_eq!(kept[12 * 20 + 12], 0);
+        assert!(largest_component(&[], 0, 0).is_empty());
     }
 }

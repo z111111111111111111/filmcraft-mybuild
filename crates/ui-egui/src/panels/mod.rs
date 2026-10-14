@@ -11,6 +11,7 @@ pub mod essential_sound;
 pub mod events;
 pub mod export_mode;
 pub mod file_dialogs;
+pub mod font_picker;
 pub mod frame_export;
 pub mod graphics;
 pub mod graphics_templates;
