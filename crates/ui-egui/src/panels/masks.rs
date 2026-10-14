@@ -575,26 +575,6 @@ pub fn draft_path(points: &[[f64; 4]]) -> MaskPath {
 /// else the first selected video clip); Human Select tracks it forward, like isolating a
 /// subject over a background. After a selection the tool returns to Selection so the new
 /// outline is editable at once.
-fn object_overlay(app: &mut FilmcraftApp, ui: &mut egui::Ui, pic: Rect, frame: (u32, u32)) {
-    let human = app.ui.tool == Tool::HumanSelect;
-    let id = if human { "human-select" } else { "object-select" };
-    let clip = app.session.active_sequence().and_then(|q| {
-        app.session.state.selected_mask.map(|m| m.clip).or_else(|| {
-            app.session.state.selection.iter().copied().find(|c| {
-                q.find_item(*c).and_then(|(t, _)| q.track(t)).is_some_and(|t| t.kind == TrackKind::Video)
-            })
-        })
-    });
-    let Some(clip) = clip else {
-        app.ui.status = "Select a video clip first, then click an object to mask it".into();
-        return;
-    };
-    let Some(it) = app.session.active_sequence().and_then(|q| q.find_item(clip)).map(|(_, i)| i.clone()) else { return };
-    let ph = app.session.playhead();
-    if ph < it.start || ph >= it.end() {
-        app.ui.status = "Move the playhead over the clip, then click an object to mask it".into();
-        return;
-    }
 /// A computed outline waiting for confirmation: the seed params (without `clip`), the
 /// outline and anchor in clip pixels, and the playhead it was computed at (moving the
 /// playhead drops it, since it belongs to another frame).
