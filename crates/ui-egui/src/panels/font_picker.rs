@@ -87,6 +87,18 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut Ui, id_salt: &str, current: &str, w
     // a space glyph)
     families.retain(|(f, _)| !f.starts_with('.'));
     let t = app.tokens;
+    // families bound to interface fonts: only these can preview rows in their own
+    // typeface (an unbound FontFamily::Name panics inside epaint instead of falling back)
+    let registered: std::collections::HashSet<String> = ui.ctx().fonts_mut(|f| {
+        f.definitions()
+            .families
+            .keys()
+            .filter_map(|fam| match fam {
+                FontFamily::Name(n) => Some(n.to_string()),
+                _ => None,
+            })
+            .collect()
+    });
     let search_id = (id_salt.to_string(), "font-search");
     let search_id = egui::Id::new(search_id);
     let mut picked: Option<String> = None;
@@ -122,7 +134,13 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut Ui, id_salt: &str, current: &str, w
                             if star.clicked() {
                                 toggle_favorite(app, fam);
                             }
-                            let face = RichText::new(fam).font(FontId::new(12.0, FontFamily::Name(fam.as_str().into()))).size(12.0);
+                            // preview in its own typeface when bound; otherwise the plain name
+                            // with a ✕ whose hover note says the preview failed
+                            let face = if registered.contains(fam) {
+                                RichText::new(fam).font(FontId::new(12.0, FontFamily::Name(fam.as_str().into()))).size(12.0)
+                            } else {
+                                RichText::new(fam).size(12.0)
+                            };
                             let row = ui.selectable_label(false, face);
                             let visible = row.rect.intersect(ui.clip_rect());
                             if visible.is_positive() {
@@ -130,6 +148,9 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut Ui, id_salt: &str, current: &str, w
                             }
                             if row.clicked() {
                                 picked = Some(fam.clone());
+                            }
+                            if !registered.contains(fam) {
+                                let _ = ui.label("✕").on_hover_text(tl!("Preview unavailable for this font"));
                             }
                         });
                     }
