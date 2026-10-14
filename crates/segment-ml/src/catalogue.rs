@@ -16,7 +16,9 @@ use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
-use crate::{SegmentError, Subject};
+use crate::Subject;
+#[cfg(feature = "download")]
+use crate::SegmentError;
 
 /// One file of a model.
 #[derive(Clone, Copy, Debug, Serialize)]

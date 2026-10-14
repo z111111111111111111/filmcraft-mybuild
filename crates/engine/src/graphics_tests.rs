@@ -670,10 +670,10 @@ fn standard_effects_reorder_like_layers() {
     let clip = ClipId(r["clips"][0].as_u64().unwrap());
     s.execute("effects.apply", json!({"clips": [clip.0], "effect": "gaussian_blur"})).unwrap();
     s.execute("effects.apply", json!({"clips": [clip.0], "effect": "lumetri"})).unwrap();
-    let order = || {
+    let order = |s: &Session| {
         s.active_sequence().unwrap().find_item(clip).unwrap().1.effects.iter().map(|e| e.effect.clone()).collect::<Vec<_>>()
     };
-    let intrinsic_at = || {
+    let intrinsic_at = |s: &Session| {
         s.active_sequence()
             .unwrap()
             .find_item(clip)
@@ -684,26 +684,26 @@ fn standard_effects_reorder_like_layers() {
             .position(|e| e.def().is_some_and(|d| d.intrinsic))
             .unwrap()
     };
-    let before = order();
+    let before = order(&s);
     let gi = before.iter().position(|e| e == "gaussian_blur").unwrap();
     let li = before.iter().position(|e| e == "lumetri").unwrap();
     assert!(gi < li, "{before:?}");
     let undo = s.history.undo.len();
     s.execute("effects.reorder", json!({"clip": clip.0, "from": li, "to": gi})).unwrap();
-    let after = order();
+    let after = order(&s);
     assert_eq!(after[gi], "lumetri");
     assert_eq!(after[li], "gaussian_blur");
-    assert_eq!(after[intrinsic_at()], before[intrinsic_at()], "intrinsics stay");
+    assert_eq!(after[intrinsic_at(&s)], before[intrinsic_at(&s)], "intrinsics stay");
     assert_eq!(s.history.undo.len(), undo + 1, "one undo step");
     s.execute("edit.undo", json!({})).unwrap();
-    assert_eq!(order(), before);
+    assert_eq!(order(&s), before);
 
     // fixed effects refuse to move either way, and nothing changes
-    let mi = intrinsic_at();
+    let mi = intrinsic_at(&s);
     let undo = s.history.undo.len();
     assert!(s.execute("effects.reorder", json!({"clip": clip.0, "from": mi, "to": gi})).is_err());
     assert!(s.execute("effects.reorder", json!({"clip": clip.0, "from": gi, "to": mi})).is_err());
     assert!(s.execute("effects.reorder", json!({"clip": clip.0, "from": 99, "to": 0})).is_err());
-    assert_eq!(order(), before);
+    assert_eq!(order(&s), before);
     assert_eq!(s.history.undo.len(), undo);
 }
