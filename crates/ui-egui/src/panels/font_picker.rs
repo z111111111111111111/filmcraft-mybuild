@@ -122,8 +122,8 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut Ui, id_salt: &str, current: &str, w
                             if star.clicked() {
                                 toggle_favorite(app, fam);
                             }
-                            let face = RichText::new(fam).font(FontId::new(12.0, FontFamily::Name(fam.clone()))).size(12.0);
-                            let row = ui.add(egui::SelectableLabel::new(false, face));
+                            let face = RichText::new(fam).font(FontId::new(12.0, FontFamily::Name(fam.as_str().into()))).size(12.0);
+                            let row = ui.selectable_label(false, face);
                             let visible = row.rect.intersect(ui.clip_rect());
                             if visible.is_positive() {
                                 app.auto.add(&format!("{auto_id}.option.{fam}"), visible, fam);
