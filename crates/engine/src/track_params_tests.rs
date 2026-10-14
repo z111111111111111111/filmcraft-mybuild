@@ -46,7 +46,7 @@ fn naming_a_missing_track_grows_it_for_place_and_move() {
     assert_eq!(s.history.undo.len(), undo);
     // past the cap, and names that cannot address a track, are still parameter errors
     for (key, name, msg) in
-        [("audioTrack", json!(999_999), "a sequence has at most 999 tracks of a kind"), ("track", json!("V0"), "no track V0 in this sequence"), ("track", json!("X1"), "no track X1 in this sequence")]
+        [("audioTrack", json!(999_999), "no track 999999 in this sequence"), ("track", json!("V0"), "no track V0 in this sequence"), ("track", json!("X1"), "no track X1 in this sequence")]
     {
         let mut p = json!({"item": item.0, "time": 0});
         p[key] = name.clone();
