@@ -1,0 +1,79 @@
+# Build a Windows .exe in the cloud (GitHub Actions) so no Rust is needed
+# on your own PC. Run it manually from the Actions tab, then download the
+# `filmcraft-windows-x64` artifact and launch filmcraft.exe (optionally with
+# WGPU_BACKEND=dx12, see run-dx12.bat).
+name: Build Windows EXE
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Check out the project
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo builds
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: filmcraft-windows-exe
+
+      - name: Build FilmCraft (release)
+        run: cargo build --release -p filmcraft -p filmcraft-cli
+
+      - name: Check the segmentation crate
+        run: cargo test -p filmcraft-segment-ml --features download
+
+      - name: Check the segmentation crate (with ML)
+        run: cargo test -p filmcraft-segment-ml --all-features
+
+      - name: Upload the executables
+        uses: actions/upload-artifact@v4
+        with:
+          name: filmcraft-windows-x64
+          path: |
+            target/release/filmcraft.exe
+            target/release/filmcraft-cli.exe
+
+  # A second build with AI subject segmentation (Object / Human Select): SAM 2 and BiRefNet over
+  # ONNX Runtime, and the model downloader. ORT ships onnxruntime.dll next to the exe. This build
+  # is larger and slower; the default build above stays pure Rust.
+  build-ai:
+    runs-on: windows-latest
+    steps:
+      - name: Check out the project
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo builds
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: filmcraft-windows-exe-ai
+
+      - name: Build FilmCraft (release, AI segmentation)
+        run: cargo build --release -p filmcraft --features segment
+
+      - name: Check the engine (with AI segmentation)
+        run: cargo test -p filmcraft-engine --features segment
+
+      - name: Collect ONNX Runtime
+        shell: pwsh
+        run: |
+          $dll = Get-ChildItem -Path target/release -Recurse -Filter onnxruntime.dll -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($dll) { Copy-Item $dll.FullName target/release/onnxruntime.dll; Write-Host "onnxruntime.dll: $($dll.FullName)" }
+          else { Write-Warning "onnxruntime.dll not found under target/release" }
+
+      - name: Upload the executables (AI)
+        uses: actions/upload-artifact@v4
+        with:
+          name: filmcraft-windows-x64-ai
+          if-no-files-found: warn
+          path: |
+            target/release/filmcraft.exe
+            target/release/onnxruntime.dll
