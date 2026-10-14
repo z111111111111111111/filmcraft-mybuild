@@ -28,6 +28,9 @@ jobs:
       - name: Check the segmentation crate
         run: cargo test -p filmcraft-segment-ml --features download
 
+      - name: Check the segmentation crate (with ML)
+        run: cargo test -p filmcraft-segment-ml --all-features
+
       - name: Upload the executables
         uses: actions/upload-artifact@v4
         with:
