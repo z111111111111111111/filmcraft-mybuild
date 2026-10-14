@@ -674,7 +674,8 @@ pub(crate) fn param_row(
         }
         (ParamKind::Text, ParamValue::Text(s)) if pd.id == "font" && mask.is_none() => {
             // a font picker, not a name field: search, favorites, recents, every family
-            let (picked, r) = crate::panels::font_picker::show(app, &mut vui, &format!("ec-font-{}-{idx}", clip.0), s, vui.available_width().min(170.0), &format!("effectControls.text.{idx}.{}", pd.id));
+            let w = vui.available_width().min(170.0);
+            let (picked, r) = crate::panels::font_picker::show(app, &mut vui, &format!("ec-font-{}-{idx}", clip.0), s, w, &format!("effectControls.text.{idx}.{}", pd.id));
             app.auto.add(&format!("effectControls.text.{idx}.{}", pd.id), r.rect, pd.label);
             if let Some(f) = picked {
                 set = Some(json!(f));
