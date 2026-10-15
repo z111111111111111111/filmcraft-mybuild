@@ -702,12 +702,17 @@ fn object_overlay(app: &mut FilmcraftApp, ui: &mut egui::Ui, pic: Rect, frame: (
         let cmd = if human { "masks.selectHuman" } else { "masks.selectObject" };
         match app.session.execute(cmd, params.clone()) {
             Ok(r) => {
-                let outline: Vec<[f64; 2]> = r.get("outline").and_then(Value::as_array).map(|a| a.iter().filter_map(|v| Some([v.get(0)?.as_f64()?, v.get(1)?.as_f64()?])).collect()).unwrap_or_default();
-                let at: [f64; 2] = [at.get(0).and_then(Value::as_f64).unwrap_or(0.0), at.get(1).and_then(Value::as_f64).unwrap_or(0.0)];
-                if let Some(o) = params.as_object_mut() {
-                    o.remove("preview");
+                if r.get("downloading").and_then(Value::as_bool).unwrap_or(false) {
+                    // the model is on its way: no outline to confirm yet, the next click retries
+                    app.ui.status = downloading_status(&r, human);
+                } else {
+                    let outline: Vec<[f64; 2]> = r.get("outline").and_then(Value::as_array).map(|a| a.iter().filter_map(|v| Some([v.get(0)?.as_f64()?, v.get(1)?.as_f64()?])).collect()).unwrap_or_default();
+                    let at: [f64; 2] = [at.get(0).and_then(Value::as_f64).unwrap_or(0.0), at.get(1).and_then(Value::as_f64).unwrap_or(0.0)];
+                    if let Some(o) = params.as_object_mut() {
+                        o.remove("preview");
+                    }
+                    ui.data_mut(|m| m.insert_temp(pending_id(id), PendingOutline { clip: clip.0, human, params, outline, at, tick: ph }));
                 }
-                ui.data_mut(|m| m.insert_temp(pending_id(id), PendingOutline { clip: clip.0, human, params, outline, at, tick: ph }));
             }
             Err(e) => app.ui.status = e.to_string(),
         }
@@ -762,7 +767,9 @@ fn select_at(app: &mut FilmcraftApp, clip: ClipId, human: bool, mut params: Valu
     let cmd = if human { "masks.selectHuman" } else { "masks.selectObject" };
     match app.session.execute(cmd, params) {
         Ok(r) => {
-            if r.get("engine").and_then(Value::as_str) == Some("ml") {
+            if r.get("downloading").and_then(Value::as_bool).unwrap_or(false) {
+                app.ui.status = downloading_status(&r, human);
+            } else if r.get("engine").and_then(Value::as_str) == Some("ml") {
                 let name = r.get("name").and_then(Value::as_str).unwrap_or("AI mask");
                 app.ui.status = format!("{name} — AI subject mask (soft edges)");
             } else {
@@ -773,6 +780,14 @@ fn select_at(app: &mut FilmcraftApp, clip: ClipId, human: bool, mut params: Valu
         }
         Err(e) => app.ui.status = e.to_string(),
     }
+}
+
+/// Status line while an AI model downloads in the background (first Object/Human Select click
+/// with `engine: auto` and no model yet).
+fn downloading_status(r: &Value, human: bool) -> String {
+    let what = r.get("model").and_then(Value::as_str).unwrap_or(if human { "human" } else { "object" });
+    let size = r.get("size").and_then(Value::as_u64).map(|b| format!(" ({:.0}MB)", b as f64 / 1_048_576.0)).unwrap_or_default();
+    format!("Downloading the AI {what} model{size} in the background — click again when it finishes")
 }
 
 fn pen_overlay(app: &mut FilmcraftApp, ui: &mut egui::Ui, pic: Rect, frame: (u32, u32)) {

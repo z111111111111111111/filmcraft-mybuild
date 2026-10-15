@@ -47,13 +47,13 @@ pub(crate) fn commands() -> Vec<CommandSpec> {
         spec(
             "masks.selectObject",
             "Select Object",
-            r#"{"clip":id?,"effect":index|id?="opacity","point":[x,y]? (clip pixels: grow from here),"box":[x,y,w,h]? (clip pixels: leave background margin around the object; the background is cut from its border),"tolerance":0..100?=25 (colour leeway),"feather":px?=0,"engine":"auto"|"ml"|"classic"?=auto (AI model when installed),"preview":bool?=false (outline only: no mask, no track),"track":"forward"|"backward"? (track the new mask right away)}"#,
+            r#"{"clip":id?,"effect":index|id?="opacity","point":[x,y]? (clip pixels: grow from here),"box":[x,y,w,h]? (clip pixels: leave background margin around the object; the background is cut from its border),"tolerance":0..100?=25 (colour leeway),"feather":px?=0,"engine":"auto"|"ml"|"classic"?=auto (AI model when installed, downloaded on first use),"preview":bool?=false (outline only: no mask, no track),"track":"forward"|"backward"? (track the new mask right away)}"#,
             |s, p| select_subject(s, p, false),
         ),
         spec(
             "masks.selectHuman",
             "Select Human",
-            r#"{"clip":id?,"effect":index|id?="opacity","box":[x,y,w,h]? (clip pixels: drag around the person),"point":[x,y]? (clip pixels; one of `box`/`point` is required),"tolerance":0..100?=25,"feather":px?=2,"engine":"auto"|"ml"|"classic"?=auto (AI model when installed),"preview":bool?=false,"track":"forward"|"backward"|"none"?="forward" (the mask follows the person)}"#,
+            r#"{"clip":id?,"effect":index|id?="opacity","box":[x,y,w,h]? (clip pixels: drag around the person),"point":[x,y]? (clip pixels; one of `box`/`point` is required),"tolerance":0..100?=25,"feather":px?=2,"engine":"auto"|"ml"|"classic"?=auto (AI model when installed, downloaded on first use),"preview":bool?=false,"track":"forward"|"backward"|"none"?="forward" (the mask follows the person)}"#,
             |s, p| select_subject(s, p, true),
         ),
         spec(
@@ -359,6 +359,46 @@ fn ml_ready(human: bool) -> bool {
     ml_model_dir(human).is_some()
 }
 
+/// Fetch a missing model in the background when `auto` needs it: the first click starts the
+/// download (answered as `{"downloading": true, "job"}`), the next click segments. Returns
+/// `None` when this build cannot download or run models (the caller falls back to the
+/// classical tools) — so only downloadable builds ever download, and only on demand. A
+/// download already running for the model is reused, never doubled.
+#[cfg(feature = "segment-download")]
+fn auto_download(s: &mut Session, human: bool) -> Option<Value> {
+    if !seg::available() {
+        return None;
+    }
+    let subject = if human { seg::Subject::Human } else { seg::Subject::Object };
+    let m = seg::catalogue::for_subject(subject)?;
+    let dir = crate::transcript::models_dir()?;
+    let label = format!("Downloading {}", m.name);
+    if let Some(id) = s.jobs.iter().find(|j| j.label == label && !j.progress.finished.load(std::sync::atomic::Ordering::Relaxed)).map(|j| j.id) {
+        return Some(downloading_json(m, id));
+    }
+    let job = new_job(s, label);
+    job.progress.total.store(seg::catalogue::missing_bytes(&dir, m), std::sync::atomic::Ordering::Relaxed);
+    let (prog, res, dirc, mc) = (job.progress.clone(), job.result.clone(), dir.clone(), m);
+    let id = spawn(s, job, false, "filmcraft-seg-download", move || {
+        let t0 = web_time::Instant::now();
+        let r = download_package_seg(&dirc, mc, &prog);
+        finish_job(&prog, &res, r.map(|()| format!("{} installed", mc.name)), t0);
+    })
+    .ok()?;
+    Some(downloading_json(m, id))
+}
+
+#[cfg(not(feature = "segment-download"))]
+fn auto_download(_s: &mut Session, _human: bool) -> Option<Value> {
+    None
+}
+
+/// The pending-download answer: the UI shows it instead of an outline and retries later.
+#[cfg(feature = "segment-download")]
+fn downloading_json(m: &'static seg::catalogue::ModelInfo, job: u64) -> Value {
+    json!({"engine": "ml", "downloading": true, "job": job, "model": m.id, "size": m.size()})
+}
+
 /// A human-readable reason for a segmentation failure.
 fn ml_err(e: &seg::SegmentError) -> String {
     match e {
@@ -561,6 +601,13 @@ fn select_subject(s: &mut Session, p: &Value, human: bool) -> Result<Value> {
     };
     if engine == SegEngine::Ml && !seg::available() {
         return Err(bad(cmd, "AI segmentation is not available in this build (built without the `segment` feature)"));
+    }
+    // `auto` fetches a missing model in the background instead of silently segmenting the
+    // classical way: the first click downloads, the next one segments (see `auto_download`)
+    if engine == SegEngine::Auto && !ml_ready(human) {
+        if let Some(r) = auto_download(s, human) {
+            return Ok(r);
+        }
     }
     // decode at working size; flood fill is linear in pixels
     let scale = (SELECT_MAX_WIDTH / sw.max(sh)).min(1.0) as f32;
