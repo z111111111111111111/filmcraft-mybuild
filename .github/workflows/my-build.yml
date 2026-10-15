@@ -65,9 +65,22 @@ jobs:
       - name: Collect ONNX Runtime
         shell: pwsh
         run: |
-          $dll = Get-ChildItem -Path target/release -Recurse -Filter onnxruntime.dll -ErrorAction SilentlyContinue | Select-Object -First 1
+          $dll = Get-ChildItem -Path target -Recurse -Filter onnxruntime.dll -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $dll) {
+            Write-Host "--- ort-sys build output (where the download went) ---"
+            Get-ChildItem -Path target/release/build -Filter "ort-sys-*" -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+              $dir = $_.FullName
+              foreach ($n in @("output", "stderr")) {
+                $f = Join-Path $dir $n
+                if (Test-Path $f) { Get-Content $f -ErrorAction SilentlyContinue | Select-String -Pattern "onnxruntime|download|extract|copy|link-search" | Select-Object -First 25 }
+              }
+            }
+            Write-Host "--- searching the cargo home ---"
+            $home = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { Join-Path $env:USERPROFILE ".cargo" }
+            $dll = Get-ChildItem -Path $home -Recurse -Filter onnxruntime.dll -ErrorAction SilentlyContinue | Select-Object -First 1
+          }
           if ($dll) { Copy-Item $dll.FullName target/release/onnxruntime.dll; Write-Host "onnxruntime.dll: $($dll.FullName)" }
-          else { Write-Warning "onnxruntime.dll not found under target/release" }
+          else { Write-Error "onnxruntime.dll not found anywhere (see diagnostics above): refusing to ship an AI build without its runtime"; exit 1 }
 
       - name: Upload the executables (AI)
         uses: actions/upload-artifact@v4
